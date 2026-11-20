@@ -223,7 +223,8 @@ func ExecuteWithStdin(ctx context.Context, command string, stdin io.Reader, opts
 		if cmd == nil {
 			cmd = exec.CommandContext(timeoutCtx, "/bin/bash", "-c", command)
 		}
-		cmd.Stdin = stdin
+		cleanupStdin := attachStdin(cmd, stdin)
+		defer cleanupStdin()
 	}
 
 	// Run in its own process group and kill the whole group on timeout/cancel,
@@ -296,4 +297,52 @@ func Shell() string {
 		return "powershell.exe"
 	}
 	return "/bin/bash"
+}
+
+// NeedsPassword reports whether running command requires aig to collect a
+// sudo password itself: it uses sudo and no graphical askpass helper exists.
+func NeedsPassword(command string) bool {
+	return runtime.GOOS != "windows" && reSudo.MatchString(command) && AskpassHelper() == ""
+}
+
+// UsesSudo reports whether command invokes sudo.
+func UsesSudo(command string) bool {
+	return reSudo.MatchString(command)
+}
+
+// attachStdin connects stdin to cmd without letting os/exec own a copying
+// goroutine. When cmd.Stdin is not an *os.File, exec copies it in a goroutine
+// and Wait blocks until that copy ends — which never happens for an
+// interactive pipe the caller keeps open (WaitDelay doesn't help: exec still
+// waits for the goroutine after closing its own pipes). Instead the child gets
+// a real OS pipe and we copy into it ourselves; returning from Run never
+// depends on stdin reaching EOF.
+func attachStdin(cmd *exec.Cmd, stdin io.Reader) func() {
+	switch s := stdin.(type) {
+	case nil:
+		return func() {}
+	case *os.File:
+		cmd.Stdin = s
+		return func() {}
+	case *bytes.Buffer:
+		// Finite input reaches EOF by itself; exec's own copy is fine.
+		cmd.Stdin = s
+		return func() {}
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		cmd.Stdin = stdin // fall back to exec's copying
+		return func() {}
+	}
+	cmd.Stdin = pr
+	go func() {
+		_, _ = io.Copy(pw, stdin)
+		_ = pw.Close()
+	}()
+	return func() {
+		// The child has exited: release our ends. A copy still blocked on
+		// stdin.Read ends when the caller closes its writer.
+		_ = pr.Close()
+		_ = pw.Close()
+	}
 }

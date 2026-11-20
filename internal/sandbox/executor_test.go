@@ -4,6 +4,8 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -84,5 +86,38 @@ func TestAskpassRequiresDisplay(t *testing.T) {
 	t.Setenv("DISPLAY", "")
 	if AskpassHelper() != "" {
 		t.Error("askpass must not be used without a graphical session")
+	}
+}
+
+func TestOpenInteractiveStdinDoesNotBlockCompletion(t *testing.T) {
+	// The caller keeps the pipe open (as the TUI does for Ctrl+I input).
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	start := time.Now()
+	res, err := ExecuteWithStdin(context.Background(), "echo hi", pr, Options{Timeout: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("command that ignores stdin took %s", elapsed)
+	}
+	if strings.TrimSpace(res.Stdout) != "hi" || res.Note != "" {
+		t.Fatalf("stdout=%q note=%q", res.Stdout, res.Note)
+	}
+}
+
+func TestInteractiveStdinIsDelivered(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		fmt.Fprintln(pw, "world")
+	}()
+	res, err := ExecuteWithStdin(context.Background(), "read x; echo hello $x", pr, Options{Timeout: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(res.Stdout) != "hello world" {
+		t.Fatalf("stdout=%q", res.Stdout)
 	}
 }
