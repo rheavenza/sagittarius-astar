@@ -19,6 +19,9 @@ type ToolCall struct {
 	ID   string
 	Name string
 	Args map[string]any
+	// ThoughtSignature is an opaque token Gemini attaches to function-call parts
+	// of thinking models. It must be echoed back verbatim on the next request.
+	ThoughtSignature []byte `json:",omitempty"`
 }
 
 // Tool describes a callable function to the LLM.
@@ -30,7 +33,7 @@ type Tool struct {
 
 // Message represents a single turn in a conversation.
 type Message struct {
-	Role             string     // RoleUser | RoleAssistant | RoleSystem | RoleTool
+	Role             string // RoleUser | RoleAssistant | RoleSystem | RoleTool
 	Content          string
 	ReasoningContent string     // DeepSeek thinking models: chain-of-thought that must be echoed back
 	ToolCalls        []ToolCall // If the assistant called tools

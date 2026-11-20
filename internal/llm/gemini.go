@@ -55,58 +55,16 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 		logger.L.Debug("gemini: stream finished", "tokens_received", tokenCount)
 	}()
 
-	// Build conversation contents from message history.
-	var contents []*genai.Content
-	var systemInstruction *genai.Content
-
-	for _, msg := range messages {
-		switch msg.Role {
-		case RoleSystem:
-			// Gemini handles the system prompt as a separate config field,
-			// not as a conversation turn.
-			systemInstruction = genai.NewContentFromText(msg.Content, genai.RoleUser)
-		case RoleUser:
-			contents = append(contents, genai.NewContentFromText(msg.Content, genai.RoleUser))
-		case RoleAssistant:
-			var parts []*genai.Part
-			if msg.ReasoningContent != "" {
-				parts = append(parts, &genai.Part{
-					Thought: true,
-					Text:    msg.ReasoningContent,
-				})
-			}
-			if len(msg.ToolCalls) > 0 {
-				for _, tc := range msg.ToolCalls {
-					parts = append(parts, &genai.Part{
-						FunctionCall: &genai.FunctionCall{
-							Name: tc.Name,
-							Args: tc.Args,
-						},
-					})
-				}
-			} else if msg.Content != "" {
-				parts = append(parts, &genai.Part{
-					Text: msg.Content,
-				})
-			}
-			if len(parts) > 0 {
-				contents = append(contents, &genai.Content{
-					Role:  genai.RoleModel,
-					Parts: parts,
-				})
-			}
-		case RoleTool:
-			var response map[string]any
-			if err := json.Unmarshal([]byte(msg.Content), &response); err != nil {
-				response = map[string]any{"output": msg.Content}
-			}
-			contents = append(contents, genai.NewContentFromFunctionResponse(msg.ToolName, response, genai.RoleUser))
-		}
-	}
+	contents, systemInstruction := buildGeminiContents(messages)
 
 	cfg := &genai.GenerateContentConfig{}
 	if systemInstruction != nil {
 		cfg.SystemInstruction = systemInstruction
+	}
+	if geminiSupportsThinking(g.model) {
+		// Without IncludeThoughts the API never returns thought summaries, so
+		// the reasoning display would stay empty.
+		cfg.ThinkingConfig = &genai.ThinkingConfig{IncludeThoughts: true}
 	}
 	if len(tools) > 0 {
 		var decls []*genai.FunctionDeclaration
@@ -154,9 +112,10 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 				}
 				if part.FunctionCall != nil {
 					collectedCalls = append(collectedCalls, ToolCall{
-						ID:   part.FunctionCall.ID,
-						Name: part.FunctionCall.Name,
-						Args: part.FunctionCall.Args,
+						ID:               part.FunctionCall.ID,
+						Name:             part.FunctionCall.Name,
+						Args:             part.FunctionCall.Args,
+						ThoughtSignature: part.ThoughtSignature,
 					})
 					// Do not stream text when tool calls are being made.
 					continue
@@ -179,4 +138,84 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 		return collectedCalls, reasoningBuf.String(), nil
 	}
 	return nil, reasoningBuf.String(), nil
+}
+
+// geminiSupportsThinking reports whether a model accepts ThinkingConfig.
+// Gemini 1.x and 2.0 models reject it; 2.5 and later support it.
+func geminiSupportsThinking(model string) bool {
+	m := strings.ToLower(model)
+	return !strings.HasPrefix(m, "gemini-1") && !strings.HasPrefix(m, "gemini-2.0")
+}
+
+// buildGeminiContents converts the provider-neutral history into Gemini
+// contents plus a system instruction.
+//
+// Gemini has exactly one system instruction per request, so only the FIRST
+// system message is used for it. Later system messages (command output,
+// /read attachments, loop-breaker notes) are sent as user-role text marked
+// "[system note]". Previously each one overwrote the system instruction,
+// which silently dropped the persona.
+//
+// Consecutive user-role contents (text, notes, function responses) are merged
+// into a single content so parallel function responses arrive together.
+func buildGeminiContents(messages []Message) ([]*genai.Content, *genai.Content) {
+	var contents []*genai.Content
+	var systemInstruction *genai.Content
+
+	appendParts := func(role string, parts ...*genai.Part) {
+		if len(parts) == 0 {
+			return
+		}
+		if n := len(contents); n > 0 && contents[n-1].Role == role {
+			contents[n-1].Parts = append(contents[n-1].Parts, parts...)
+			return
+		}
+		contents = append(contents, &genai.Content{Role: role, Parts: parts})
+	}
+
+	for _, msg := range messages {
+		switch msg.Role {
+		case RoleSystem:
+			if systemInstruction == nil {
+				systemInstruction = genai.NewContentFromText(msg.Content, genai.RoleUser)
+				continue
+			}
+			appendParts(genai.RoleUser, &genai.Part{Text: "[system note]\n" + msg.Content})
+		case RoleUser:
+			appendParts(genai.RoleUser, &genai.Part{Text: msg.Content})
+		case RoleAssistant:
+			var parts []*genai.Part
+			if len(msg.ToolCalls) > 0 {
+				if msg.Content != "" {
+					parts = append(parts, &genai.Part{Text: msg.Content})
+				}
+				for _, tc := range msg.ToolCalls {
+					parts = append(parts, &genai.Part{
+						FunctionCall: &genai.FunctionCall{
+							ID:   tc.ID,
+							Name: tc.Name,
+							Args: tc.Args,
+						},
+						ThoughtSignature: tc.ThoughtSignature,
+					})
+				}
+			} else if msg.Content != "" {
+				parts = append(parts, &genai.Part{Text: msg.Content})
+			}
+			appendParts(genai.RoleModel, parts...)
+		case RoleTool:
+			var response map[string]any
+			if err := json.Unmarshal([]byte(msg.Content), &response); err != nil {
+				response = map[string]any{"output": msg.Content}
+			}
+			appendParts(genai.RoleUser, &genai.Part{
+				FunctionResponse: &genai.FunctionResponse{
+					ID:       msg.ToolCallID,
+					Name:     msg.ToolName,
+					Response: response,
+				},
+			})
+		}
+	}
+	return contents, systemInstruction
 }

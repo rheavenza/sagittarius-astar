@@ -97,13 +97,15 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 	}
 
 	req := openai.ChatCompletionRequest{
-		Model:      d.model,
-		Messages:   oaiMessages,
-		Stream:     true,
-		ToolChoice: "auto",
+		Model:    d.model,
+		Messages: oaiMessages,
+		Stream:   true,
 	}
 
+	// tool_choice is only valid when tools are supplied; OpenAI-compatible
+	// APIs reject it otherwise.
 	if len(tools) > 0 {
+		req.ToolChoice = "auto"
 		for _, t := range tools {
 			req.Tools = append(req.Tools, openai.Tool{
 				Type: openai.ToolTypeFunction,
