@@ -5,15 +5,23 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 )
+
+// closeWait bounds how long Close waits for the server to close stdout after
+// we close its stdin. Misbehaving servers are then killed by Manager.Shutdown.
+const closeWait = 2 * time.Second
 
 // jsonRPCRequest is a JSON-RPC 2.0 request envelope.
 // ID is a pointer so that notifications (no ID) can omit the field via omitempty.
 type jsonRPCRequest struct {
-	JSONRPC string `json:"jsonrpc"`          // always "2.0"
-	ID      *int64 `json:"id,omitempty"`     // nil for one-way notifications
+	JSONRPC string `json:"jsonrpc"`      // always "2.0"
+	ID      *int64 `json:"id,omitempty"` // nil for one-way notifications
 	Method  string `json:"method"`
 	Params  any    `json:"params,omitempty"`
 }
@@ -24,6 +32,24 @@ type jsonRPCResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      int64           `json:"id"`
 	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *jsonRPCError   `json:"error,omitempty"`
+}
+
+// incomingMessage is the superset envelope used to classify every line read
+// from the server: a response to us (id + result/error, no method), a
+// server→client request (id + method), or a notification (method, no id).
+type incomingMessage struct {
+	ID     json.RawMessage `json:"id,omitempty"`
+	Method string          `json:"method,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *jsonRPCError   `json:"error,omitempty"`
+}
+
+// outgoingResponse is our reply to a server→client request.
+type outgoingResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Result  any             `json:"result,omitempty"`
 	Error   *jsonRPCError   `json:"error,omitempty"`
 }
 
@@ -40,11 +66,11 @@ type jsonRPCError struct {
 // via a per-request buffered channel. This keeps the Bubble Tea event loop
 // unblocked — callers invoke Call() from within tea.Cmd goroutines.
 type Client struct {
-	server  *Server
+	server *Server
 
 	// enc serialises JSON to the child's stdin. writeOnce guards concurrent writes.
-	enc      *json.Encoder
-	writeMu  sync.Mutex
+	enc     *json.Encoder
+	writeMu sync.Mutex
 
 	// scanner reads newline-delimited JSON from the child's stdout.
 	// The buffer is enlarged to 10 MiB to accommodate large tool responses.
@@ -93,19 +119,32 @@ func (c *Client) readLoop() {
 			continue
 		}
 
-		var resp jsonRPCResponse
-		if err := json.Unmarshal(line, &resp); err != nil {
-			// Malformed JSON from the server — skip and keep reading.
+		var msg incomingMessage
+		if err := json.Unmarshal(line, &msg); err != nil {
+			logger.L.Debug("mcp: skipping malformed line", "server", c.server.Name, "error", err)
 			continue
 		}
 
-		// Notifications have no id field → resp.ID == 0.
-		// We never register a pending channel for ID=0, so they are silently
-		// dropped here. This covers "notifications/initialized" acknowledgements etc.
+		if msg.Method != "" {
+			// Server→client request or notification — never a reply to us.
+			// (Previously these were matched against our pending IDs, so a
+			// server "ping" with id 1 would hijack our request #1.)
+			if len(msg.ID) > 0 && string(msg.ID) != "null" {
+				go c.replyToServerRequest(msg)
+			}
+			continue
+		}
+
+		id, err := strconv.ParseInt(string(msg.ID), 10, 64)
+		if err != nil {
+			// We only ever send integer IDs.
+			continue
+		}
+
 		c.mu.Lock()
-		ch, ok := c.pending[resp.ID]
+		ch, ok := c.pending[id]
 		if ok {
-			delete(c.pending, resp.ID)
+			delete(c.pending, id)
 		}
 		c.mu.Unlock()
 
@@ -113,7 +152,7 @@ func (c *Client) readLoop() {
 			// Non-blocking send: the channel is buffered(1) so this never blocks
 			// even if the caller has already timed out and stopped listening.
 			select {
-			case ch <- resp:
+			case ch <- jsonRPCResponse{JSONRPC: "2.0", ID: id, Result: msg.Result, Error: msg.Error}:
 			default:
 			}
 		}
@@ -130,6 +169,22 @@ func (c *Client) readLoop() {
 		ch <- jsonRPCResponse{
 			Error: &jsonRPCError{Code: -32000, Message: "mcp: server connection closed"},
 		}
+	}
+}
+
+// replyToServerRequest answers a server-initiated request. We support "ping";
+// everything else (sampling, roots, elicitation) gets "method not found".
+func (c *Client) replyToServerRequest(msg incomingMessage) {
+	resp := outgoingResponse{JSONRPC: "2.0", ID: msg.ID}
+	if msg.Method == "ping" {
+		resp.Result = map[string]any{}
+	} else {
+		resp.Error = &jsonRPCError{Code: -32601, Message: "method not supported by aig: " + msg.Method}
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := c.enc.Encode(resp); err != nil {
+		logger.L.Debug("mcp: failed to reply to server request", "server", c.server.Name, "method", msg.Method, "error", err)
 	}
 }
 
@@ -193,8 +248,8 @@ func (c *Client) Call(ctx context.Context, method string, params any) (json.RawM
 
 // initializeParams mirrors the MCP initialize request structure.
 type initializeParams struct {
-	ProtocolVersion string             `json:"protocolVersion"`
-	Capabilities    map[string]any     `json:"capabilities"`
+	ProtocolVersion string               `json:"protocolVersion"`
+	Capabilities    map[string]any       `json:"capabilities"`
 	ClientInfo      initializeClientInfo `json:"clientInfo"`
 }
 
@@ -240,5 +295,9 @@ func (c *Client) Close() {
 		// The server should then close stdout, which terminates our scanner.
 		_ = c.server.stdin.Close()
 	})
-	<-c.readLoopDone
+	select {
+	case <-c.readLoopDone:
+	case <-time.After(closeWait):
+		logger.L.Warn("mcp: server did not close stdout after stdin EOF; leaving it to the manager", "server", c.server.Name)
+	}
 }

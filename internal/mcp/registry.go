@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
+	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 )
 
 // Tool is the MCP wire representation of a tool as returned by a tools/list RPC.
@@ -37,21 +39,35 @@ type toolCallResult struct {
 }
 
 // toolContent is a single content block from a tool response.
-// MCP defines several content types; we handle "text" and ignore the rest for now.
+// MCP defines several content types; we inline "text" and summarise the rest.
 type toolContent struct {
-	Type string `json:"type"` // "text" | "image" | "resource"
-	Text string `json:"text,omitempty"`
+	Type     string `json:"type"` // "text" | "image" | "audio" | "resource" | "resource_link"
+	Text     string `json:"text,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
+	URI      string `json:"uri,omitempty"`
+}
+
+// ToolNamePrefix is prepended to every MCP tool exposed to the LLM:
+// mcp__<server>__<tool>. Namespacing prevents MCP tools from shadowing native
+// tools (e.g. the filesystem server's write_file) and from colliding with each
+// other across servers.
+const ToolNamePrefix = "mcp__"
+
+// maxToolNameLen is the strictest provider limit (Gemini/OpenAI: 64 chars).
+const maxToolNameLen = 64
+
+// toolRef locates a namespaced tool: which server owns it and its original name.
+type toolRef struct {
+	server string
+	name   string
 }
 
 // Registry discovers and indexes tools across all connected MCP servers.
-// It is the single source of truth for:
-//   - Which tools are available (LLMTools for LLM injection)
-//   - Which server owns each tool (for dispatch in Call)
-//   - Whether a call name refers to an MCP tool (IsMCPTool for TUI routing)
 type Registry struct {
 	clients map[string]*Client // logical server name → JSON-RPC client
-	toolMap map[string]string  // MCP tool name → owning server name
-	tools   []Tool             // all discovered tools, in server-then-discovery order
+	trusted map[string]bool    // server name → skip confirmation
+	toolMap map[string]toolRef // exposed (namespaced) name → owner
+	tools   []Tool             // discovered tools; Name is the exposed name
 
 	mu sync.RWMutex
 }
@@ -63,70 +79,133 @@ func NewRegistry(m *Manager) *Registry {
 	defer m.mu.RUnlock()
 
 	clients := make(map[string]*Client, len(m.servers))
+	trusted := make(map[string]bool, len(m.servers))
 	for name, srv := range m.servers {
 		clients[name] = NewClient(srv)
+		trusted[name] = srv.Config.Trusted
 	}
 
 	return &Registry{
 		clients: clients,
-		toolMap: make(map[string]string),
+		trusted: trusted,
+		toolMap: make(map[string]toolRef),
 	}
 }
 
-// Discover runs the full MCP discovery sequence:
-//  1. Sends the initialize handshake to every server.
-//  2. Calls tools/list on each server.
-//  3. Builds the internal tool → server routing table.
-//
-// It is safe to call multiple times; subsequent calls refresh the index.
-// The caller should invoke this once at startup, after Manager.Start().
-func (r *Registry) Discover(ctx context.Context) error {
-	// Phase 1: Initialize all servers before any tool calls.
-	// We do these serially to keep startup logs readable; they are fast.
-	for name, c := range r.clients {
-		if err := c.Initialize(ctx); err != nil {
-			return fmt.Errorf("mcp: registry discover: %w", err)
+// sanitizeName maps s onto the character set accepted by every provider.
+func sanitizeName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
 		}
-		_ = name
 	}
+	return b.String()
+}
+
+// ExposedName returns the namespaced tool name sent to the LLM.
+func ExposedName(server, tool string) string {
+	name := ToolNamePrefix + sanitizeName(server) + "__" + sanitizeName(tool)
+	if len(name) > maxToolNameLen {
+		name = name[:maxToolNameLen]
+	}
+	return name
+}
+
+// Discover initializes every server and lists its tools, concurrently.
+// A server that fails is logged, closed, and dropped; the rest keep working.
+// It is safe to call multiple times; subsequent calls refresh the index.
+func (r *Registry) Discover(ctx context.Context) error {
+	type discovered struct {
+		server string
+		tools  []Tool
+		err    error
+	}
+
+	r.mu.RLock()
+	clients := make(map[string]*Client, len(r.clients))
+	for k, v := range r.clients {
+		clients[k] = v
+	}
+	r.mu.RUnlock()
+
+	results := make(chan discovered, len(clients))
+	var wg sync.WaitGroup
+	for name, c := range clients {
+		wg.Add(1)
+		go func(name string, c *Client) {
+			defer wg.Done()
+			tools, err := discoverServer(ctx, c)
+			results <- discovered{server: name, tools: tools, err: err}
+		}(name, c)
+	}
+	wg.Wait()
+	close(results)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Reset the index so re-discovery is clean.
 	r.tools = r.tools[:0]
-	r.toolMap = make(map[string]string)
+	r.toolMap = make(map[string]toolRef)
 
-	// Phase 2: Enumerate tools from each server.
-	for serverName, client := range r.clients {
-		raw, err := client.Call(ctx, "tools/list", nil)
-		if err != nil {
-			return fmt.Errorf("mcp: registry discover: server %q: tools/list: %w", serverName, err)
+	var failed []string
+	var all []discovered
+	for d := range results {
+		all = append(all, d)
+	}
+	// Deterministic order for the tool list sent to the LLM.
+	sort.Slice(all, func(i, j int) bool { return all[i].server < all[j].server })
+
+	for _, d := range all {
+		if d.err != nil {
+			logger.L.Warn("mcp: server discovery failed, skipping it", "server", d.server, "error", d.err)
+			failed = append(failed, d.server)
+			if c := r.clients[d.server]; c != nil {
+				go c.Close()
+			}
+			delete(r.clients, d.server)
+			continue
 		}
-
-		var result toolsListResult
-		if err := json.Unmarshal(raw, &result); err != nil {
-			return fmt.Errorf("mcp: registry discover: server %q: parse tools/list response: %w", serverName, err)
-		}
-
-		for _, t := range result.Tools {
-			// Last-write-wins on name collision across servers.
-			// This mirrors the Claude Desktop convention.
+		for _, t := range d.tools {
+			exposed := ExposedName(d.server, t.Name)
+			if _, dup := r.toolMap[exposed]; dup {
+				logger.L.Warn("mcp: duplicate tool name after namespacing, skipping", "server", d.server, "tool", t.Name)
+				continue
+			}
+			r.toolMap[exposed] = toolRef{server: d.server, name: t.Name}
+			t.Name = exposed
 			r.tools = append(r.tools, t)
-			r.toolMap[t.Name] = serverName
 		}
 	}
 
+	if len(r.clients) == 0 && len(failed) > 0 {
+		return fmt.Errorf("mcp: all servers failed discovery: %s", strings.Join(failed, ", "))
+	}
 	return nil
+}
+
+// discoverServer runs initialize + tools/list against one server.
+func discoverServer(ctx context.Context, c *Client) ([]Tool, error) {
+	if err := c.Initialize(ctx); err != nil {
+		return nil, err
+	}
+	raw, err := c.Call(ctx, "tools/list", nil)
+	if err != nil {
+		return nil, fmt.Errorf("tools/list: %w", err)
+	}
+	var result toolsListResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("parse tools/list response: %w", err)
+	}
+	return result.Tools, nil
 }
 
 // LLMTools translates all discovered MCP tools into the []llm.Tool slice
 // that is injected into Provider.StreamChat() alongside the native agent tools.
-//
-// The MCP InputSchema (a raw JSON Schema object) is unmarshalled into
-// map[string]any, which is the common denominator accepted by both:
-//   - Gemini: genai.FunctionDeclaration.ParametersJsonSchema (type any)
-//   - DeepSeek: openai.FunctionDefinition.Parameters (type any)
+// Names are the namespaced mcp__<server>__<tool> form.
 //
 // If schema unmarshalling fails for a tool, a bare {"type":"object"} is
 // substituted so the tool remains callable with untyped arguments.
@@ -149,33 +228,23 @@ func (r *Registry) LLMTools() []llm.Tool {
 	return out
 }
 
-// Call invokes a named MCP tool on its registered server and returns the
-// concatenated text from all "text" content blocks in the response.
-//
-// This function is designed to be wrapped in a tea.Cmd goroutine:
-//
-//	return func() tea.Msg {
-//	    result, err := registry.Call(ctx, call.Name, call.Args)
-//	    if err != nil {
-//	        return toolCallResultMsg{..., Error: err}
-//	    }
-//	    return toolCallResultMsg{..., Result: result}
-//	}
+// Call invokes a namespaced MCP tool on its server and returns the text of the
+// response. Non-text blocks are summarised as placeholders.
 func (r *Registry) Call(ctx context.Context, name string, args map[string]any) (string, error) {
 	r.mu.RLock()
-	serverName, ok := r.toolMap[name]
-	client := r.clients[serverName]
+	ref, ok := r.toolMap[name]
+	client := r.clients[ref.server]
 	r.mu.RUnlock()
 
 	if !ok {
 		return "", fmt.Errorf("mcp: tool %q is not registered", name)
 	}
 	if client == nil {
-		return "", fmt.Errorf("mcp: tool %q: server %q has no active client", name, serverName)
+		return "", fmt.Errorf("mcp: tool %q: server %q has no active client", name, ref.server)
 	}
 
 	params := toolCallParams{
-		Name:      name,
+		Name:      ref.name,
 		Arguments: args,
 	}
 	if params.Arguments == nil {
@@ -192,30 +261,32 @@ func (r *Registry) Call(ctx context.Context, name string, args map[string]any) (
 		return "", fmt.Errorf("mcp: tool %q: parse response: %w", name, err)
 	}
 
-	// Collect all text content blocks into a single string.
-	var sb strings.Builder
+	var parts []string
 	for _, c := range result.Content {
-		if c.Type == "text" && c.Text != "" {
-			sb.WriteString(c.Text)
+		switch c.Type {
+		case "text":
+			if c.Text != "" {
+				parts = append(parts, c.Text)
+			}
+		case "resource", "resource_link":
+			parts = append(parts, fmt.Sprintf("[%s omitted: %s]", c.Type, c.URI))
+		default:
+			parts = append(parts, fmt.Sprintf("[%s content omitted (%s)]", c.Type, c.MimeType))
 		}
 	}
+	text := strings.Join(parts, "\n")
 
 	if result.IsError {
-		// The server signalled a logical error via the IsError flag.
-		// We return it as a Go error so processNextToolCall surfaces it correctly.
-		errText := sb.String()
-		if errText == "" {
-			errText = "tool reported an error with no detail"
+		if text == "" {
+			text = "tool reported an error with no detail"
 		}
-		return "", fmt.Errorf("mcp: tool %q error: %s", name, errText)
+		return "", fmt.Errorf("mcp: tool %q error: %s", name, text)
 	}
 
-	return sb.String(), nil
+	return text, nil
 }
 
-// IsMCPTool returns true if name matches a tool discovered from any MCP server.
-// Used by processNextToolCall in the TUI to route dispatch away from the
-// native sandbox tool switch.
+// IsMCPTool returns true if name is a namespaced tool from any MCP server.
 func (r *Registry) IsMCPTool(name string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -223,8 +294,16 @@ func (r *Registry) IsMCPTool(name string) bool {
 	return ok
 }
 
+// IsTrusted reports whether the server owning the named tool is marked
+// "trusted" in config (its tools run without a confirmation prompt).
+func (r *Registry) IsTrusted(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ref, ok := r.toolMap[name]
+	return ok && r.trusted[ref.server]
+}
+
 // ToolCount returns the total number of MCP tools discovered across all servers.
-// Useful for startup log messages and status bar display.
 func (r *Registry) ToolCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

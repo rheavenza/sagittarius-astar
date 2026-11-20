@@ -5,6 +5,7 @@
 package mcp
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -12,20 +13,24 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 )
 
 // ServerConfig describes a single MCP server process to spawn.
 // It maps 1:1 to one entry in the config's mcp_servers map.
 type ServerConfig struct {
-	Command string            `json:"command"`          // executable path or name, e.g. "npx"
-	Args    []string          `json:"args,omitempty"`   // CLI arguments, e.g. ["-y", "@modelcontextprotocol/server-filesystem", "."]
-	Env     map[string]string `json:"env,omitempty"`    // extra env vars merged on top of os.Environ()
+	Command string            `json:"command"`        // executable path or name, e.g. "npx"
+	Args    []string          `json:"args,omitempty"` // CLI arguments, e.g. ["-y", "@modelcontextprotocol/server-filesystem", "."]
+	Env     map[string]string `json:"env,omitempty"`  // extra env vars merged on top of os.Environ()
+	// Trusted servers' tools run without a confirmation prompt.
+	Trusted bool `json:"trusted,omitempty"`
 }
 
 // Server represents a live MCP subprocess with its bidirectional stdio pipes.
 // One Server is created per entry in the mcp_servers config map.
 type Server struct {
-	Name   string       // logical name from the config key, e.g. "filesystem"
+	Name   string // logical name from the config key, e.g. "filesystem"
 	Config ServerConfig
 
 	cmd    *exec.Cmd
@@ -51,8 +56,8 @@ func NewManager() *Manager {
 }
 
 // Start spawns a subprocess for each ServerConfig in the provided map.
-// If any server fails to start, all previously started servers are shut down
-// before returning the error — no half-initialised state is left behind.
+// A server that fails to spawn is logged and skipped; the others keep running.
+// An error is returned only when servers were configured but none started.
 //
 // The context governs subprocess lifetime: cancelling it delivers os.Kill to
 // every child via exec.CommandContext semantics.
@@ -60,18 +65,20 @@ func (m *Manager) Start(ctx context.Context, configs map[string]ServerConfig) er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	started := make([]string, 0, len(configs))
+	var firstErr error
 	for name, cfg := range configs {
 		srv, err := spawnServer(ctx, name, cfg)
 		if err != nil {
-			// Roll back cleanly: kill any server we already started.
-			m.mu.Unlock()
-			m.Shutdown(context.Background())
-			m.mu.Lock()
-			return fmt.Errorf("mcp: failed to start server %q: %w", name, err)
+			logger.L.Warn("mcp: server failed to start, skipping", "server", name, "error", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("mcp: failed to start server %q: %w", name, err)
+			}
+			continue
 		}
 		m.servers[name] = srv
-		started = append(started, name)
+	}
+	if len(m.servers) == 0 && firstErr != nil {
+		return firstErr
 	}
 	return nil
 }
@@ -99,15 +106,21 @@ func spawnServer(ctx context.Context, name string, cfg ServerConfig) (*Server, e
 		_ = stdin.Close()
 		return nil, fmt.Errorf("mcp: %s: stdout pipe: %w", name, err)
 	}
-	// Discard stderr to prevent child log output from blocking the process.
-	// MCP servers commonly emit startup messages there.
-	cmd.Stderr = io.Discard
+	// Forward stderr to the aig log (line by line) so startup failures are
+	// debuggable. Reading it also prevents the child blocking on a full pipe.
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return nil, fmt.Errorf("mcp: %s: stderr pipe: %w", name, err)
+	}
 
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
 		return nil, fmt.Errorf("mcp: %s: exec start: %w", name, err)
 	}
+	go logStderr(name, stderr)
 
 	return &Server{
 		Name:   name,
@@ -205,4 +218,13 @@ func shutdownServer(s *Server) {
 	}
 
 	_ = s.stdout.Close()
+}
+
+// logStderr copies a server's stderr into the aig log until EOF.
+func logStderr(name string, r io.Reader) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		logger.L.Info("mcp: server stderr", "server", name, "line", sc.Text())
+	}
 }
