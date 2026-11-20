@@ -1,7 +1,7 @@
 # Makefile for Sagittarius A* (aig)
 
 BINARY     := aig
-MODULE     := github.com/rhea/sagittarius-astar
+MODULE     := github.com/clitorhea/sagittarius-astar.git
 CMD        := ./cmd/aig
 BIN_DIR    := bin
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")

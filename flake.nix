@@ -11,10 +11,10 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # The Go version must match go.mod (1.22+).
-        goEnv = pkgs.go_1_24;
+        # The Go version must match go.mod (1.25+).
+        goEnv = pkgs.go_1_25;
 
-        aig = pkgs.buildGoModule {
+        aig = (pkgs.buildGoModule.override { go = goEnv; }) {
           pname = "aig";
           version = "0.1.0";
           src = ./.;

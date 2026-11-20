@@ -40,6 +40,8 @@ This file serves as a compressed "brain dump" for future AI agents working on th
    - **API Key Resolving**: Resolves keys dynamically on each generation run rather than caching on start.
    - **Quick Edit Mode**: Restores Quick Edit Mode on Windows Terminal to enable native selection without breaking the TUI.
 
+5. **Review bug-fix pass (`fix/review-bugfixes`)** — see `FIXES.md` for the full list (protocol correctness, process-group kills, approvals, MCP hardening, tests).
+
 ---
 
 ## ⚠️ Crucial Rules & Quirks for Future AIs
@@ -48,4 +50,10 @@ This file serves as a compressed "brain dump" for future AI agents working on th
 - **MCP Server Graces**: When adding or managing MCP servers, ensure `Registry.Shutdown()` is called *before* `Manager.Shutdown()` to drain pending requests safely before closing the pipes.
 - **Bubble Tea State Changes**: Whenever the `appState` changes to something that alters the UI height (like opening the Runtime Input box), you MUST ensure `m.recalculateDimensions()` is called so the viewport resizes correctly.
 - **Loop Breaker State Resets**: Ensure `consecutiveSameCalls` and `consecutiveErrors` are correctly reset upon tool execution successes or state changes to prevent false positives.
+- **Every tool_call needs a result**: Any path that stops a tool batch early (loop breaker, user abort, denial, cancelled write/sudo) MUST append a tool message for each unanswered call (`answerRemainingToolCalls` / `skippedToolResults` in `internal/tui/toolflow.go`). OpenAI-compatible APIs return HTTP 400 otherwise.
+- **Gemini system messages**: Only the first `RoleSystem` message becomes Gemini's system instruction; later ones are sent as `[system note]` user text (`buildGeminiContents`). Don't reintroduce "last one wins".
+- **MCP names**: MCP tools are exposed as `mcp__<server>__<tool>` (`mcp.ExposedName`); the registry maps back to the original name for `tools/call`.
+- **Tool approvals**: `run_command`, writes, MCP tools (unless `trusted`), `web_fetch`, and filesystem reads outside `workspaceRoot` require confirmation unless `/approve-tools on`. Use `askToolApproval` for new sensitive tools.
+- **Sudo**: Prefer the askpass path (`sandbox.AskpassHelper`). Never write to an `io.Pipe` on the Update goroutine — writes block until read (use `seedStdin`).
+- **Goroutines in tea.Cmds** must use snapshotted values, never read the live `Model`.
 - **Dynamic Context Injection**: Dynamic system instructions (like the PAR loop directive) should only be injected into the *outgoing* history array during streaming, keeping the session database/history clean.

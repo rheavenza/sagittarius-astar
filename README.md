@@ -24,7 +24,7 @@
 ## Features
 
 ### Core Capabilities
-- 🤖 **Multi-Provider & Model Integration** — Support for Google Gemini (official Go SDK, including `gemini-2.0-flash`, `gemini-2.5-pro`, etc.) and DeepSeek (OpenAI-compatible, including `deepseek-v4-flash`, `deepseek-v4-pro`, etc.). Switch providers and models on-the-fly inside the active session.
+- 🤖 **Multi-Provider & Model Integration** — Support for Google Gemini (official Go SDK, including `gemini-2.5-flash` (default), `gemini-2.5-pro`, etc.) and DeepSeek (OpenAI-compatible, including `deepseek-v4-flash`, `deepseek-v4-pro`, etc.). Switch providers and models on-the-fly inside the active session.
 - 🔌 **Model Context Protocol (MCP) Host** — Dynamic host architecture supporting any stdio transport MCP server. Discovers schemas via `tools/list` on startup, translates them dynamically into LLM function declarations, and runs RPC tool calls asynchronously.
 - 🧠 **Interleaved Reasoning & PAR Loops** — Renders model thinking phases in real-time under a separate, styled deliberating section (Catppuccin subtext, left border, status badge). Dynamically enforces a **Plan-Action-Reflection (PAR)** directive when tools are active to optimize tool-calling ergonomics.
 - ⚡ **Autonomous Tool-Calling Agent Loop** — Runs multi-turn tool loops sequentially to resolve complex tasks (e.g., read file, search, write/edit file, run test command, repeat).
@@ -49,7 +49,8 @@ The agent can autonomously invoke these tools:
 
 ### Safety & Command Sandboxing
 - 🛡️ **Interactive Gating**: Full confirmation dialogs for file mutations (`write_file`, `edit_file`) showing unified diffs.
-- ⚡ **Auto-Approve Mode**: Enable auto-approve (`/approve-tools on` or CLI flag) to execute sandbox commands (`run_command`) autonomously without manual confirmation prompts.
+- ⚡ **Auto-Approve Mode**: Enable auto-approve (`/approve-tools on` or CLI flag) to execute commands (`run_command`), MCP tools, `web_fetch` and out-of-workspace reads without confirmation prompts. Without it, reads inside the working directory run freely; everything else asks first.
+- 🔐 **Sudo via KDE dialog**: In a graphical session with `ksshaskpass` (or `$SUDO_ASKPASS`) available, `sudo` is run as `sudo -A` so the password goes through a desktop dialog and is never seen by aig.
 - 🔄 **Loop Breaker Circuit**: Automatically intercepts and blocks infinite loops or cascading errors. If the model invokes the exact same tool with identical arguments 3 times consecutively, or experiences 3 consecutive tool failures, execution is aborted, and a warning is injected to force re-evaluation.
 - 🛑 **Graceful Interrupts**: Cancel active streams or executing sandbox commands safely using `Ctrl+C` without crashing the application.
 
@@ -97,9 +98,7 @@ On first launch, `aig` generates a default `config.json` at:
   "gemini_api_key": "YOUR_GEMINI_KEY",
   "deepseek_api_key": "YOUR_DEEPSEEK_KEY",
   "personas": {
-    "default": "You are aig...",
-    "sysadmin": "You are an expert Linux and Windows system administrator...",
-    "coder": "You are an expert software engineer..."
+    "reviewer": "Your own persona. Built-ins (default, sysadmin, coder) are always available; entries here override them."
   },
   "mcp_servers": {
     "filesystem": {
@@ -107,7 +106,8 @@ On first launch, `aig` generates a default `config.json` at:
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/workspace"],
       "env": {
         "NODE_ENV": "production"
-      }
+      },
+      "trusted": false
     }
   }
 }
@@ -119,6 +119,11 @@ On first launch, `aig` generates a default `config.json` at:
 2. **Dynamic Discovery**: Automatically sends the `initialize` handshake and queries `tools/list` over the pipe.
 3. **LLM Translation**: Translates discovered schemas on-the-fly to function declarations for Gemini and OpenAI/DeepSeek models.
 4. **Asynchronous Execution**: Dispatches requested tools in non-blocking Bubble Tea commands with `Ctrl+C` interrupt support.
+5. **Namespacing & approval**: Tools are exposed as `mcp__<server>__<tool>` so they never shadow built-ins. Each call asks for confirmation unless the server has `"trusted": true` or `/approve-tools on` is active.
+6. **Fault isolation**: A server that fails to start or to answer discovery is skipped; its stderr is written to the aig log.
+
+### Per-directory prompt (`./aig.md`)
+If the working directory contains `aig.md`, aig asks once before using it as the system prompt, and remembers the approval (by content hash) in `~/.config/aig/trusted_prompts.json`. If the file changes, aig asks again.
 
 
 ---
@@ -162,7 +167,7 @@ aig -r 20260521-170000
 | `/provider <name>` | Switch the active provider on-the-fly (keeps conversation history) |
 | `/persona` | List available personas configured |
 | `/persona <name>` | Switch the system prompt/persona on-the-fly (takes effect on next message) |
-| `/approve-tools on\|off` | Toggle auto-approve mode for commands (shows `⚡auto` badge in status bar when active) |
+| `/approve-tools on\|off` | Toggle auto-approve for commands and sensitive tools (shows `⚡auto` badge in status bar when active) |
 | `/map [dir]` | Generates and injects a tree-like map of `[dir]` into the conversation history |
 | `/exit` | Exit the application |
 | `Ctrl+C` | Cancel a running command / token stream |
