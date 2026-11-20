@@ -271,3 +271,35 @@ func TestBuildModelItems(t *testing.T) {
 		t.Fatalf("filter failed: %+v", filtered)
 	}
 }
+
+func TestCleanTitle(t *testing.T) {
+	cases := []struct{ raw, query, want string }{
+		{`"Debugging Make Test"`, "q", "Debugging Make Test"},
+		{"<think>hmm</think>Fix Login Bug\nextra line", "q", "Fix Login Bug"},
+		{"", "why does make test fail on my machine today", "why does make test fail on …"},
+		{"   ", "", "Untitled"},
+	}
+	for _, c := range cases {
+		if got := cleanTitle(c.raw, c.query); got != c.want {
+			t.Errorf("cleanTitle(%q, %q) = %q, want %q", c.raw, c.query, got, c.want)
+		}
+	}
+}
+
+// slowTitleProvider fails title requests (like a timeout) but answers turns.
+type slowTitleProvider struct{ fakeProvider }
+
+func (s *slowTitleProvider) StreamChat(ctx context.Context, msgs []llm.Message, defs []llm.Tool, ch chan<- string) ([]llm.ToolCall, string, error) {
+	if len(defs) == 0 {
+		close(ch)
+		return nil, "", context.DeadlineExceeded
+	}
+	return s.fakeProvider.StreamChat(ctx, msgs, defs, ch)
+}
+
+func TestTUITitleFallsBackWhenGenerationFails(t *testing.T) {
+	p := &slowTitleProvider{fakeProvider{replies: []scripted{{tokens: []string{"answer"}}}}}
+	d := newDriver(t, p)
+	d.submit("explain the agent package please")
+	d.runUntil("fallback title", func(m Model) bool { return m.activeSession.Name == "explain the agent package please" })
+}

@@ -1068,37 +1068,65 @@ func (m Model) generateSessionTitleCmd() tea.Cmd {
 		return nil
 	}
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Large hosted models (e.g. on NIM) can take well over 10s before the
+		// first token, so allow a generous budget.
+		ctx, cancel := context.WithTimeout(context.Background(), titleTimeout)
 		defer cancel()
 
 		prompt := fmt.Sprintf("Summarize the following topic/query into a short, concise conversation title of 3-5 words. Return ONLY the title, with no quotation marks, no markdown formatting, and no extra text:\n\n%s", userQuery)
 
 		tokenChan := make(chan string, 100)
+		errCh := make(chan error, 1)
 		go func() {
 			_, _, err := provider.StreamChat(ctx, []llm.Message{
 				{Role: llm.RoleUser, Content: prompt},
 			}, nil, tokenChan)
-			if err != nil {
-				logger.L.Error("title generation background stream failed", "error", err)
-			}
+			errCh <- err
 		}()
 
 		var sb strings.Builder
 		for token := range tokenChan {
-			sb.WriteString(token)
+			if !strings.HasPrefix(token, "\x00") { // skip native reasoning
+				sb.WriteString(token)
+			}
+		}
+		if err := <-errCh; err != nil {
+			logger.L.Warn("title generation failed, using fallback title", "error", err)
 		}
 
-		title := strings.TrimSpace(sb.String())
-		title = strings.Trim(title, "\"`'*")
+		title := cleanTitle(sb.String(), userQuery)
 		logger.L.Info("generated session title", "title", title)
-		if title == "" {
-			return sessionTitleMsg("")
-		}
-		if len(title) > 60 {
-			title = title[:57] + "..."
-		}
 		return sessionTitleMsg(title)
 	}
+}
+
+// titleTimeout bounds background session-title generation.
+const titleTimeout = 60 * time.Second
+
+// cleanTitle normalizes a generated title. If the model returned nothing
+// usable (error, timeout, empty), it falls back to the first words of the
+// user's query so sessions are never left "Untitled".
+func cleanTitle(raw, query string) string {
+	text, _, _ := llm.SplitReasoning(raw) // drop inline <think> blocks
+	title := strings.TrimSpace(text)
+	if i := strings.IndexByte(title, '\n'); i >= 0 {
+		title = strings.TrimSpace(title[:i])
+	}
+	title = strings.Trim(title, "\"`'*#. ")
+	if title == "" {
+		words := strings.Fields(query)
+		if len(words) > 6 {
+			words = append(words[:6], "…")
+		}
+		title = strings.Join(words, " ")
+	}
+	if len(title) > 60 {
+		title = tools.TruncateUTF8(title, 57) + "..."
+	}
+	if title == "" {
+		title = "Untitled"
+	}
+	return title
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
