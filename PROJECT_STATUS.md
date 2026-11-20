@@ -56,4 +56,7 @@ This file serves as a compressed "brain dump" for future AI agents working on th
 - **Tool approvals**: `run_command`, writes, MCP tools (unless `trusted`), `web_fetch`, and filesystem reads outside `workspaceRoot` require confirmation unless `/approve-tools on`. Use `askToolApproval` for new sensitive tools.
 - **Sudo**: Prefer the askpass path (`sandbox.AskpassHelper`). Never write to an `io.Pipe` on the Update goroutine — writes block until read (use `seedStdin`).
 - **Goroutines in tea.Cmds** must use snapshotted values, never read the live `Model`.
+- **Context block**: `prompt.BuildContextBlock` (env + instruction files) is computed once at startup in `main.go` and appended to the first system message of the outgoing copy only (`withContextBlock`). Keep it stable within a session (prompt caching); don't put per-request data (timestamps, git dirty state) in it.
+- **read_file line numbers**: output is `%6d\t` prefixed. `applyEdit` strips accidentally copied prefixes; keep both in sync if the format changes.
+- **Write tools**: `write_file`, `edit_file`, `multi_edit` all go through `stateConfirmingWrite`; `PostEditCheck` runs in the commit goroutine.
 - **Dynamic Context Injection**: Dynamic system instructions (like the PAR loop directive) should only be injected into the *outgoing* history array during streaming, keeping the session database/history clean.

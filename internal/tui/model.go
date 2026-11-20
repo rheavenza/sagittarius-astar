@@ -157,6 +157,10 @@ type Model struct {
 	// the batch are then marked aborted and control returns to the user.
 	toolAbortRequested bool
 
+	// contextBlock (environment + project instructions) is appended to the
+	// system prompt of every outgoing request, never stored in history.
+	contextBlock string
+
 	// workspaceRoot is the directory aig was started in; read-only tools may
 	// access it freely, anything outside requires approval.
 	workspaceRoot string
@@ -1145,11 +1149,23 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 				m.textarea.Focus()
 				m.appendOutput(confirmStyle.Render("✍  Writing file…"))
 				m.refreshViewport()
+				m.execTimeout = 60 * time.Second // includes the post-edit check
+				var checks map[string]string
+				if m.fileConfig != nil {
+					checks = m.fileConfig.PostEditChecks
+				}
 				return m, tea.Batch(func() tea.Msg {
 					if err := CommitWrite(*pw); err != nil {
 						return toolCallResultMsg{CallID: callID, Name: toolName, Error: err}
 					}
-					return toolCallResultMsg{CallID: callID, Name: toolName, Result: fmt.Sprintf("Successfully wrote %s", pw.Path)}
+					result := fmt.Sprintf("Successfully wrote %s", pw.Path)
+					if len(pw.Notes) > 0 {
+						result += " (" + strings.Join(pw.Notes, "; ") + ")"
+					}
+					if check := PostEditCheck(context.Background(), pw.Path, checks); check != "" {
+						result += "\n\n" + check
+					}
+					return toolCallResultMsg{CallID: callID, Name: toolName, Result: result}
 				}, m.spinner.Tick)
 			case tea.KeyEsc:
 				return m, m.rejectPendingWrite()
@@ -1505,6 +1521,13 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			}
 		} else {
 			m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s done", msg.Name)))
+			if i := strings.Index(msg.Result, "Post-edit check"); i >= 0 {
+				style := lipgloss.NewStyle().Foreground(colorSubtext)
+				if strings.Contains(msg.Result[i:], "FAILED") {
+					style = errorStyle
+				}
+				m.appendOutput(style.Render("  " + strings.ReplaceAll(msg.Result[i:], "\n", "\n  ")))
+			}
 			if msg.Name == "run_command" {
 				m.appendOutput(execResultStyle.Render(msg.Result))
 				outStr := strings.ToLower(msg.Result)
@@ -2304,6 +2327,7 @@ func (m *Model) startStreaming() []tea.Cmd {
 	// Snapshot everything the goroutine needs. It must not read the live
 	// Model, which the Update loop keeps mutating.
 	provider := m.provider
+	contextBlock := m.contextBlock
 	history := append([]llm.Message(nil), m.history...)
 	registry := m.mcpRegistry
 
@@ -2318,35 +2342,10 @@ func (m *Model) startStreaming() []tea.Cmd {
 			tools = append(tools, registry.LLMTools()...)
 		}
 
-		// Dynamically append the Plan-Action-Reflection directive if tools are present
-		var outgoingHistory []llm.Message
-		if len(tools) > 0 {
-			outgoingHistory = make([]llm.Message, len(prunedHistory))
-			copy(outgoingHistory, prunedHistory)
-
-			parDirective := "\n\nPlan-Action-Reflection Loop Enforcements:\n" +
-				"When executing actions with access to tools, you must strictly follow this cycle:\n" +
-				"1. Plan: State your assumptions, sub-goals, and concrete action plan inside your internal reasoning block BEFORE emitting a tool call.\n" +
-				"2. Action: Call the appropriate tool with precise parameters.\n" +
-				"3. Reflection: After receiving the tool output, evaluate whether the observation satisfied the sub-goal, check for errors, and state your updated reasoning/next steps before either proceeding to the next tool or generating your final response."
-
-			found := false
-			for i, msg := range outgoingHistory {
-				if msg.Role == llm.RoleSystem {
-					outgoingHistory[i].Content = msg.Content + parDirective
-					found = true
-					break
-				}
-			}
-			if !found {
-				outgoingHistory = append([]llm.Message{{
-					Role:    llm.RoleSystem,
-					Content: parDirective,
-				}}, outgoingHistory...)
-			}
-		} else {
-			outgoingHistory = prunedHistory
-		}
+		// Append the session context block (environment + project
+		// instructions) to the first system message of the OUTGOING copy only,
+		// so history and saved sessions stay clean.
+		outgoingHistory := withContextBlock(prunedHistory, contextBlock)
 
 		toolCalls, reasoningContent, err := provider.StreamChat(ctx, outgoingHistory, tools, ch)
 		if err != nil {
@@ -2533,12 +2532,16 @@ func (m *Model) processNextToolCall() tea.Cmd {
 		// Simpler: in stateConfirmingCmd Enter, detect pendingLang=="" to know it's a tool call.
 		return nil
 
-	case "write_file", "edit_file":
-		_, pw, _ := ExecuteToolWithWrite(call)
+	case "write_file", "edit_file", "multi_edit":
+		_, pw, prepErr := ExecuteToolWithWrite(call)
 		if pw == nil {
-			// Shouldn't happen, but guard.
+			// Invalid arguments or no match: report the real reason so the
+			// model can fix its call.
+			if prepErr == nil || prepErr == ErrWriteConfirmationRequired {
+				prepErr = fmt.Errorf("%s: failed to prepare write", call.Name)
+			}
 			return func() tea.Msg {
-				return toolCallResultMsg{CallID: call.ID, Name: call.Name, Error: fmt.Errorf("%s: failed to prepare write", call.Name)}
+				return toolCallResultMsg{CallID: call.ID, Name: call.Name, Error: prepErr}
 			}
 		}
 		m.pendingWrite = pw
@@ -2546,11 +2549,14 @@ func (m *Model) processNextToolCall() tea.Cmd {
 		m.pendingWriteName = call.Name
 
 		icon := "💾"
-		if call.Name == "edit_file" {
+		if call.Name == "edit_file" || call.Name == "multi_edit" {
 			icon = "✏️ "
 		}
 		m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
 			fmt.Sprintf("%s %s: %s", icon, call.Name, pw.Path)))
+		for _, note := range pw.Notes {
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("  ℹ " + note))
+		}
 
 		// Show diff if available, otherwise show content preview.
 		if pw.Diff != "" && pw.Diff != "(no changes)" {
@@ -2881,4 +2887,25 @@ func findThinkOpen(s string) (int, string, string) {
 		}
 	}
 	return best, open, closeTag
+}
+
+// SetContextBlock sets the environment/instructions block appended to the
+// system prompt of every request.
+func (m *Model) SetContextBlock(block string) {
+	m.contextBlock = strings.TrimSpace(block)
+}
+
+// withContextBlock returns a copy of history whose first system message has
+// block appended (or a new leading system message if there is none).
+func withContextBlock(history []llm.Message, block string) []llm.Message {
+	if block == "" {
+		return history
+	}
+	out := make([]llm.Message, len(history))
+	copy(out, history)
+	if len(out) > 0 && out[0].Role == llm.RoleSystem {
+		out[0].Content = strings.TrimSpace(out[0].Content) + "\n\n" + block
+		return out
+	}
+	return append([]llm.Message{{Role: llm.RoleSystem, Content: block}}, out...)
 }

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 	"github.com/clitorhea/sagittarius-astar.git/internal/mcp"
+	"github.com/clitorhea/sagittarius-astar.git/internal/prompt"
 	"github.com/clitorhea/sagittarius-astar.git/internal/session"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tui"
 )
@@ -248,6 +250,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 		logger.L.Error("TUI init failed", "error", err)
 		return fmt.Errorf("failed to initialize TUI: %w", err)
 	}
+	model.SetContextBlock(buildContextBlock())
 
 	p := tea.NewProgram(
 		model,
@@ -267,41 +270,79 @@ func runChat(_ *cobra.Command, _ []string) error {
 
 // resolveLocalPrompt returns "aig.md" if a ./aig.md exists and the user has
 // approved its current content (now or previously); otherwise "".
-//
-// Any repository could ship an aig.md, so it is never used silently: the
-// first time (and whenever its content changes) the user is asked on the
-// terminal before the TUI starts.
 func resolveLocalPrompt() string {
 	info, err := os.Stat(config.LocalPromptFile)
 	if err != nil || info.IsDir() {
 		return ""
 	}
-	if config.IsPromptTrusted(config.LocalPromptFile) {
+	if askTrust(config.LocalPromptFile, "It would REPLACE your system prompt") {
 		return config.LocalPromptFile
 	}
+	return ""
+}
 
-	// Only ask when we can actually talk to a human.
-	if st, err := os.Stdin.Stat(); err != nil || st.Mode()&os.ModeCharDevice == 0 {
-		logger.L.Warn("ignoring untrusted ./aig.md (no terminal to ask for consent)")
+// buildContextBlock detects the environment and loads instruction files
+// (AGENTS.md, CLAUDE.md, .aig/instructions.md in cwd and the git root, plus
+// the user's global ~/.config/aig/AGENTS.md). Repo files need consent.
+func buildContextBlock() string {
+	cwd, err := os.Getwd()
+	if err != nil {
 		return ""
 	}
+	env := prompt.DetectEnv(cwd)
 
-	data, _ := os.ReadFile(config.LocalPromptFile)
+	var files []prompt.InstructionFile
+	if g := prompt.GlobalInstructionFile(filepath.Dir(config.Path())); g != "" {
+		if f, err := prompt.LoadInstructionFile(g, true); err == nil {
+			files = append(files, f)
+		}
+	}
+	for _, p := range prompt.FindInstructionFiles(cwd, env.GitRoot) {
+		if !askTrust(p, "It will be added to the agent's instructions") {
+			continue
+		}
+		if f, err := prompt.LoadInstructionFile(p, false); err == nil {
+			files = append(files, f)
+		}
+	}
+	logger.L.Info("context block built", "git_root", env.GitRoot, "instruction_files", len(files))
+	return prompt.BuildContextBlock(env, files)
+}
+
+// askTrust returns true if path was previously approved with its current
+// content, or the user approves it now on the terminal (before the TUI
+// starts). Approval is remembered by content hash; edits invalidate it.
+//
+// Any repository can ship such files, so they are never used silently.
+func askTrust(path, effect string) bool {
+	if config.IsPromptTrusted(path) {
+		return true
+	}
+	// Only ask when we can actually talk to a human.
+	if st, err := os.Stdin.Stat(); err != nil || st.Mode()&os.ModeCharDevice == 0 {
+		logger.L.Warn("ignoring untrusted prompt file (no terminal to ask for consent)", "path", path)
+		return false
+	}
+
+	data, _ := os.ReadFile(path)
 	preview := strings.TrimSpace(string(data))
 	if len(preview) > 400 {
 		preview = strings.ToValidUTF8(preview[:400], "") + "\n…"
 	}
-	fmt.Fprintf(os.Stderr, "Found ./%s (%d bytes). It would replace your system prompt:\n\n%s\n\nUse it and remember this version? [y/N] ",
-		config.LocalPromptFile, len(data), preview)
+	fmt.Fprintf(os.Stderr, "\nFound %s (%d bytes). %s:\n\n%s\n\nUse it and remember this version? [y/N] ",
+		path, len(data), effect, preview)
 
-	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	answer, _ := stdinReader.ReadString('\n')
 	answer = strings.ToLower(strings.TrimSpace(answer))
 	if answer != "y" && answer != "yes" {
-		fmt.Fprintln(os.Stderr, "→ ignoring ./aig.md for this run.")
-		return ""
+		fmt.Fprintf(os.Stderr, "→ ignoring %s for this run.\n", path)
+		return false
 	}
-	if err := config.TrustPrompt(config.LocalPromptFile); err != nil {
-		logger.L.Warn("failed to record aig.md trust", "error", err)
+	if err := config.TrustPrompt(path); err != nil {
+		logger.L.Warn("failed to record prompt trust", "path", path, "error", err)
 	}
-	return config.LocalPromptFile
+	return true
 }
+
+// stdinReader is shared so consecutive prompts don't lose buffered input.
+var stdinReader = bufio.NewReader(os.Stdin)

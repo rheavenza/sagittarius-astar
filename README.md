@@ -124,6 +124,25 @@ On first launch, `aig` generates a default `config.json` at:
 5. **Namespacing & approval**: Tools are exposed as `mcp__<server>__<tool>` so they never shadow built-ins. Each call asks for confirmation unless the server has `"trusted": true` or `/approve-tools on` is active.
 6. **Fault isolation**: A server that fails to start or to answer discovery is skipped; its stderr is written to the aig log.
 
+### Project context & instructions
+On startup aig builds a context block that is appended to the system prompt of every request (never stored in the session):
+- **Environment**: working dir, git root and branch, OS (with Bazzite/ostree hints), date, detected stack (`go.mod`, `package.json`, …), and useful CLI tools on PATH.
+- **Instruction files**: `AGENTS.md`, `CLAUDE.md`, `.aig/instructions.md` in the working directory and the git root (each needs one-time consent, re-asked when the file changes), plus your global `~/.config/aig/AGENTS.md` (always trusted).
+
+### Coding tools
+| Tool | What it does |
+|---|---|
+| `read_file` | Line-numbered output (`N<TAB>line`), line ranges, cut off at 50 KB on a line boundary |
+| `find_files` | Glob search (`*.go`, `internal/**/*_test.go`, `*.{ts,tsx}`), `.gitignore`-aware |
+| `search_regex` | ripgrep when installed, Go fallback; `.gitignore`-aware, skips binaries, `case_insensitive` |
+| `edit_file` | Exact replace, `replace_all`, tolerant of whitespace/indentation differences and copied line numbers |
+| `multi_edit` | Several edits to one file, applied atomically with one diff and one confirmation |
+
+After each confirmed write aig runs a quick check and returns the result to the model: `go vet` on the package (or `gofmt -e`), `python3 -m py_compile`, `bash -n`, `node --check`, JSON validation. Override or extend per extension:
+```json
+"post_edit_checks": { ".ts": "npx tsc --noEmit -p {dir}", ".py": "off" }
+```
+
 ### NVIDIA NIM
 - Provider name `nim` (alias `nvidia`). Uses the OpenAI-compatible API at `https://integrate.api.nvidia.com/v1`, or `nim_base_url` / `NIM_BASE_URL` for a self-hosted NIM (no API key needed then).
 - `/model` and `/models <filter>` fetch the live model list from the endpoint, so new catalog models work without an aig update.

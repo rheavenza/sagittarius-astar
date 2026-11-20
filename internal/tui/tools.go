@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"html"
 	"io"
-	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,6 +36,10 @@ type PendingWrite struct {
 	// changed in the meantime, so a stale proposal can't clobber newer edits.
 	Original string
 	Existed  bool
+
+	// Notes describe fuzzy matching that was applied (shown to the user and
+	// reported back to the model).
+	Notes []string
 }
 
 // ErrStaleWrite is returned by CommitWrite when the target changed after the
@@ -73,7 +76,7 @@ func AgentTools() []llm.Tool {
 		// ── read_file ────────────────────────────────────────────────────────
 		{
 			Name:        "read_file",
-			Description: "Read the contents of a file. Use start_line/end_line to read a specific range instead of the whole file when you only need part of it.",
+			Description: "Read a text file. Each output line is prefixed with its line number and a TAB (\"    42\\tcode\"); these prefixes are NOT part of the file — never include them in edit_file old_content. Large files are cut off; use start_line/end_line to read a specific range.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -134,8 +137,61 @@ Always prefer this over write_file when editing an existing file.`,
 						"type":        "string",
 						"description": "The replacement text",
 					},
+					"replace_all": map[string]any{
+						"type":        "boolean",
+						"description": "Replace every occurrence instead of requiring a unique match (e.g. renaming a variable within the file).",
+					},
 				},
 				"required": []string{"path", "old_content", "new_content"},
+			},
+		},
+		// ── multi_edit ───────────────────────────────────────────────────────
+		{
+			Name: "multi_edit",
+			Description: `Apply several search/replace edits to ONE file in a single step (one diff, one confirmation).
+Edits are applied in order; each sees the result of the previous one. Each old_content must match exactly once unless replace_all is set.
+If any edit fails, nothing is written. Prefer this over several edit_file calls on the same file.`,
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path": map[string]any{
+						"type":        "string",
+						"description": "Path to the file to edit",
+					},
+					"edits": map[string]any{
+						"type":        "array",
+						"description": "The edits to apply, in order",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"old_content": map[string]any{"type": "string", "description": "Exact text to replace"},
+								"new_content": map[string]any{"type": "string", "description": "Replacement text"},
+								"replace_all": map[string]any{"type": "boolean", "description": "Replace every occurrence"},
+							},
+							"required": []string{"old_content", "new_content"},
+						},
+					},
+				},
+				"required": []string{"path", "edits"},
+			},
+		},
+		// ── find_files ───────────────────────────────────────────────────────
+		{
+			Name:        "find_files",
+			Description: "Find files by glob pattern, respecting .gitignore. Patterns without '/' match file names anywhere (\"*.go\"); use '**' for any depth (\"internal/**/*_test.go\") and {a,b} for alternatives (\"*.{ts,tsx}\").",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"pattern": map[string]any{
+						"type":        "string",
+						"description": "Glob pattern",
+					},
+					"dir": map[string]any{
+						"type":        "string",
+						"description": "Directory to search (default: .)",
+					},
+				},
+				"required": []string{"pattern"},
 			},
 		},
 		// ── run_command ──────────────────────────────────────────────────────
@@ -181,7 +237,7 @@ Prefer specific, targeted commands. Avoid commands that start interactive sessio
 		// ── search_regex ─────────────────────────────────────────────────────
 		{
 			Name:        "search_regex",
-			Description: "Search for a regex pattern across files in a directory (like grep -rn). Returns matching file paths, line numbers, and line content.",
+			Description: "Search file contents for a regular expression (like grep -rn), respecting .gitignore and skipping binary files. Returns path:line: text for up to 50 matches.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -195,7 +251,11 @@ Prefer specific, targeted commands. Avoid commands that start interactive sessio
 					},
 					"file_glob": map[string]any{
 						"type":        "string",
-						"description": "Optional glob pattern to filter files (e.g. *.go, *.py).",
+						"description": "Optional glob to filter files (e.g. *.go, src/**/*.ts).",
+					},
+					"case_insensitive": map[string]any{
+						"type":        "boolean",
+						"description": "Match case-insensitively",
 					},
 				},
 				"required": []string{"pattern"},
@@ -273,50 +333,16 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 			return "", nil, fmt.Errorf("read_file: missing or invalid 'path' argument")
 		}
 
-		const maxBytes = 50 * 1024 // 50 KB safety cap
-
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return "", nil, err
 		}
-
-		// Apply line range if specified.
-		startLine, hasStart := intArg(call.Args, "start_line")
-		endLine, hasEnd := intArg(call.Args, "end_line")
-
-		if hasStart || hasEnd {
-			lines := strings.Split(string(data), "\n")
-			total := len(lines)
-
-			start := 1
-			if hasStart && startLine >= 1 {
-				start = startLine
-			}
-			end := total
-			if hasEnd && endLine > 0 && endLine < total {
-				end = endLine
-			}
-			if start > total {
-				start = total
-			}
-			if end < start {
-				end = start
-			}
-
-			selected := lines[start-1 : end]
-			header := fmt.Sprintf("// %s  lines %d-%d (of %d)\n", path, start, end, total)
-			content := header + strings.Join(selected, "\n")
-			if len(content) > maxBytes {
-				content = truncateUTF8(content, maxBytes) + "\n// ... (truncated at 50 KB — use start_line/end_line)"
-			}
-			return content, nil, nil
+		if looksBinary(data) {
+			return fmt.Sprintf("%s appears to be a binary file (%d bytes); not shown.", path, len(data)), nil, nil
 		}
-
-		content := string(data)
-		if len(content) > maxBytes {
-			content = truncateUTF8(content, maxBytes) + "\n// ... (truncated at 50 KB — use start_line/end_line)"
-		}
-		return content, nil, nil
+		startLine, _ := intArg(call.Args, "start_line")
+		endLine, _ := intArg(call.Args, "end_line")
+		return numberedLines(path, string(data), startLine, endLine), nil, nil
 
 	// ── write_file ───────────────────────────────────────────────────────────
 	case "write_file":
@@ -347,25 +373,51 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 			return "", nil, fmt.Errorf("edit_file: missing 'new_content' argument")
 		}
 
+		replaceAll, _ := call.Args["replace_all"].(bool)
+
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return "", nil, fmt.Errorf("edit_file: cannot read %s: %w", path, err)
 		}
 		fileStr := string(data)
-
-		count := strings.Count(fileStr, oldContent)
-		switch count {
-		case 0:
-			return "", nil, fmt.Errorf("edit_file: old_content not found in %s — check exact whitespace and indentation", path)
-		case 1:
-			// good
-		default:
-			return "", nil, fmt.Errorf("edit_file: old_content matches %d locations in %s — add more surrounding context to make it unique", count, path)
+		newFileStr, note, err := applyEdit(fileStr, editOp{Old: oldContent, New: newContent, ReplaceAll: replaceAll})
+		if err != nil {
+			return "", nil, fmt.Errorf("edit_file %s: %w", path, err)
 		}
+		pw := &PendingWrite{Path: path, Content: newFileStr, Diff: simpleDiff(fileStr, newFileStr), Original: fileStr, Existed: true}
+		if note != "" {
+			pw.Notes = append(pw.Notes, note)
+		}
+		return "", pw, ErrWriteConfirmationRequired
 
-		newFileStr := strings.Replace(fileStr, oldContent, newContent, 1)
-		diff := simpleDiff(fileStr, newFileStr)
-		return "", &PendingWrite{Path: path, Content: newFileStr, Diff: diff, Original: fileStr, Existed: true}, ErrWriteConfirmationRequired
+	// ── multi_edit ───────────────────────────────────────────────────────────
+	case "multi_edit":
+		path, ok := call.Args["path"].(string)
+		if !ok || path == "" {
+			return "", nil, fmt.Errorf("multi_edit: missing 'path' argument")
+		}
+		ops, err := parseEditOps(call.Args["edits"])
+		if err != nil {
+			return "", nil, err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", nil, fmt.Errorf("multi_edit: cannot read %s: %w", path, err)
+		}
+		original := string(data)
+		current := original
+		var notes []string
+		for i, op := range ops {
+			next, note, err := applyEdit(current, op)
+			if err != nil {
+				return "", nil, fmt.Errorf("multi_edit %s: edit #%d: %w (no edits were applied)", path, i+1, err)
+			}
+			if note != "" {
+				notes = append(notes, fmt.Sprintf("edit #%d: %s", i+1, note))
+			}
+			current = next
+		}
+		return "", &PendingWrite{Path: path, Content: current, Diff: simpleDiff(original, current), Original: original, Existed: true, Notes: notes}, ErrWriteConfirmationRequired
 
 	// ── run_command ──────────────────────────────────────────────────────────
 	// run_command is gated by the TUI (auto-approve or confirmation dialog).
@@ -418,73 +470,28 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 		}
 		fileGlob, _ := call.Args["file_glob"].(string)
 
-		re, err := regexp.Compile(pattern)
+		caseInsensitive, _ := call.Args["case_insensitive"].(bool)
+		out, err := searchFiles(pattern, dir, fileGlob, caseInsensitive)
 		if err != nil {
-			return "", nil, fmt.Errorf("search_regex: invalid pattern %q: %w", pattern, err)
+			return "", nil, err
 		}
+		return out, nil, nil
 
-		var matches []string
-		matchCount := 0
-		const maxMatches = 50
-
-		walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				if d != nil && d.IsDir() && path != dir {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if d.IsDir() {
-				// Previously directories were only "not searched themselves",
-				// so .git and node_modules were still fully descended into.
-				if path != dir && (workspace.IsIgnoredDir(d.Name()) || strings.HasPrefix(d.Name(), ".")) {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if strings.HasPrefix(d.Name(), ".") {
-				return nil
-			}
-			if info, err := d.Info(); err != nil || info.Size() > maxSearchFileBytes {
-				return nil
-			}
-			if fileGlob != "" {
-				matched, _ := filepath.Match(fileGlob, d.Name())
-				if !matched {
-					return nil
-				}
-			}
-			data, err := os.ReadFile(path)
-			if err != nil || looksBinary(data) {
-				return nil
-			}
-			lines := strings.Split(string(data), "\n")
-			for i, line := range lines {
-				if re.MatchString(line) {
-					line = strings.TrimSpace(line)
-					if len(line) > 300 {
-						line = truncateUTF8(line, 300) + "…"
-					}
-					matches = append(matches, fmt.Sprintf("%s:%d: %s", path, i+1, line))
-					matchCount++
-					if matchCount >= maxMatches {
-						return io.EOF
-					}
-				}
-			}
-			return nil
-		})
-		if walkErr != nil && walkErr != io.EOF {
-			return "", nil, fmt.Errorf("search_regex: walk error: %w", walkErr)
+	// ── find_files ───────────────────────────────────────────────────────────
+	case "find_files":
+		pattern, ok := call.Args["pattern"].(string)
+		if !ok || pattern == "" {
+			return "", nil, fmt.Errorf("find_files: missing 'pattern' argument")
 		}
-		if len(matches) == 0 {
-			return fmt.Sprintf("No matches found for pattern %q in %s", pattern, dir), nil, nil
+		dir, _ := call.Args["dir"].(string)
+		if dir == "" {
+			dir = "."
 		}
-		result := strings.Join(matches, "\n")
-		if matchCount >= maxMatches {
-			result += fmt.Sprintf("\n... (truncated at %d matches)", maxMatches)
+		out, err := findFiles(pattern, dir)
+		if err != nil {
+			return "", nil, err
 		}
-		return result, nil, nil
+		return out, nil, nil
 
 	// ── map_workspace ────────────────────────────────────────────────────────
 	case "map_workspace":
@@ -691,6 +698,58 @@ var (
 	}()
 )
 
+// maxReadBytes caps how much of a file read_file returns at once.
+const maxReadBytes = 50 * 1024
+
+// numberedLines renders lines [start, end] (1-indexed, inclusive; 0 = open
+// ended) of content with "%6d\t" line-number prefixes, stopping at
+// maxReadBytes on a line boundary.
+func numberedLines(path, content string, start, end int) string {
+	lines := strings.Split(content, "\n")
+	if len(lines) > 1 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1] // a trailing newline is not a line
+	}
+	total := len(lines)
+	if total == 0 || (total == 1 && lines[0] == "") {
+		return fmt.Sprintf("(%s is empty)", path)
+	}
+	if start < 1 {
+		start = 1
+	}
+	if end <= 0 || end > total {
+		end = total
+	}
+	if start > total {
+		return fmt.Sprintf("(%s has only %d lines)", path, total)
+	}
+	if end < start {
+		end = start
+	}
+
+	var b strings.Builder
+	if start > 1 || end < total {
+		fmt.Fprintf(&b, "(%s lines %d-%d of %d)\n", path, start, end, total)
+	}
+	last := start - 1
+	for i := start; i <= end; i++ {
+		line := lines[i-1]
+		if len(line) > 2000 {
+			line = truncateUTF8(line, 2000) + "…(line truncated)"
+		}
+		entry := fmt.Sprintf("%6d\t%s\n", i, line)
+		if b.Len()+len(entry) > maxReadBytes {
+			break
+		}
+		b.WriteString(entry)
+		last = i
+	}
+	out := strings.TrimRight(b.String(), "\n")
+	if last < end {
+		out += fmt.Sprintf("\n… (output truncated at line %d of %d — continue with start_line=%d)", last, total, last+1)
+	}
+	return out
+}
+
 // truncateUTF8 cuts s to at most max bytes without splitting a multi-byte rune.
 func truncateUTF8(s string, max int) string {
 	if len(s) <= max {
@@ -724,6 +783,7 @@ var toolPathArgs = map[string][2]string{
 	"read_file":      {"path", ""},
 	"list_directory": {"path", "."},
 	"search_regex":   {"dir", "."},
+	"find_files":     {"dir", "."},
 	"map_workspace":  {"dir", "."},
 }
 
