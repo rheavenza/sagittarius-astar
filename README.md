@@ -129,6 +129,15 @@ On first launch, `aig` generates a default `config.json` at:
   - Outside git, it keeps the original contents of the files written by aig's edit tools. Changes made by shell commands can't be undone there.
 - `/undo` restores the state before the last agent turn and saves a redo point first. `/redo` re-applies it. Repeated `/undo` walks further back.
 - `/diff` shows everything that changed since the session's first checkpoint. `/checkpoints` lists them.
+- **Permission modes**: press **Shift+Tab** to cycle, or use `/mode <ask|edits|auto|plan>`. The current mode shows in the status bar.
+  | Mode | File edits in workspace | Commands | MCP / web_fetch / outside reads |
+  |---|---|---|---|
+  | ask (default) | ask | ask | ask |
+  | accept edits | auto | ask | ask |
+  | auto | auto | auto, except destructive ones (`rm -rf`, force-push, `mkfs`, `rpm-ostree rebase`, …) | auto |
+  | plan | blocked | blocked | read-only tools only |
+
+  Writes outside the workspace always ask. Set the startup mode with `"permission_mode": "accept-edits"` in config. `/approve-tools on|off` is a shortcut for `/mode auto|ask`.
 - `/plan [task]` turns on **plan mode**: the agent can only read and search, then replies with a numbered plan. `/go` approves it and the agent implements it; `/plan off` leaves plan mode.
 - To remove old checkpoint refs: `git for-each-ref --format='%(refname)' refs/aig/ | xargs -n1 git update-ref -d`
 
@@ -209,12 +218,13 @@ aig -r 20260521-170000
 | `/undo` / `/redo` | Revert / re-apply the agent's last turn of file changes |
 | `/diff` | Show all changes since the session's first checkpoint |
 | `/checkpoints` | List workspace checkpoints |
+| `/mode [ask\|edits\|auto\|plan]` | Permission mode (Shift+Tab cycles) |
 | `/plan [task]` / `/go` | Plan mode (read-only investigation → plan), then approve and implement |
 | `/provider` | List available providers |
 | `/provider <name>` | Switch the active provider on-the-fly (keeps conversation history) |
 | `/persona` | List available personas configured |
 | `/persona <name>` | Switch the system prompt/persona on-the-fly (takes effect on next message) |
-| `/approve-tools on\|off` | Toggle auto-approve for commands and sensitive tools (shows `⚡auto` badge in status bar when active) |
+| `/approve-tools on\|off` | Shortcut for `/mode auto` / `/mode ask` |
 | `/map [dir]` | Generates and injects a tree-like map of `[dir]` into the conversation history |
 | `/exit` | Exit the application |
 | `Ctrl+C` | Cancel a running command / token stream |

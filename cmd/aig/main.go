@@ -9,6 +9,7 @@
 //	aig --persona sysadmin         # use custom prompt persona
 //	aig --resume 20260521-120000   # resume previous session
 //	aig --log-level debug          # verbose file logging
+//	aig --version                  # print version and exit
 package main
 
 import (
@@ -70,11 +71,31 @@ Examples:
   aig --provider nim --model meta/llama-3.3-70b-instruct   # NVIDIA_API_KEY
   aig --persona sysadmin
   aig --resume 20260521-170000
-  aig --log-level debug`,
+  aig --log-level debug
+  aig --version`,
+	// aig takes no positional arguments. Without this, a typo or an unknown
+	// subcommand (e.g. "aig foo") silently started the full TUI.
+	Args: cobra.NoArgs,
 	RunE: runChat,
+	// Runtime errors are printed once by main(); usage only for flag errors.
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	// Enables --version; the value is injected by LDFLAGS (see Makefile),
+	// "dev" otherwise. `aig version` is a subcommand below.
+	Version: version,
+}
+
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print the aig version",
+	Args:  cobra.NoArgs,
+	Run: func(cmd *cobra.Command, _ []string) {
+		fmt.Fprintf(cmd.OutOrStdout(), "aig version %s\n", version)
+	},
 }
 
 func init() {
+	rootCmd.AddCommand(versionCmd)
 	rootCmd.PersistentFlags().StringVarP(
 		&flagProvider, "provider", "p", "",
 		"LLM provider to use (gemini | deepseek | nim)",
@@ -103,6 +124,12 @@ func init() {
 }
 
 func runChat(_ *cobra.Command, _ []string) error {
+	// The TUI needs a real terminal. Without one (e.g. when aig itself is
+	// run by an agent's shell tool) it would hang until killed.
+	if !isTerminal(os.Stdin) || !isTerminal(os.Stdout) {
+		return fmt.Errorf("aig needs an interactive terminal (stdin and stdout must be a TTY); use 'aig --version' or 'aig --help' from scripts")
+	}
+
 	// ── Logging ──────────────────────────────────────────────────────────────
 	logLevel, err := logger.ParseLevel(flagLogLevel)
 	if err != nil {
@@ -246,7 +273,6 @@ func runChat(_ *cobra.Command, _ []string) error {
 		logger.L.Debug("MCP: no servers configured, skipping bootstrap")
 	}
 
-	// ── TUI ─────────────────────────────────────────────────────────────────────────────────
 	// ── Agent ───────────────────────────────────────────────────────────────────────────────
 	cwd, _ := os.Getwd()
 	checkpoints := checkpoint.New(cwd, activeSession.ID)
@@ -260,6 +286,17 @@ func runChat(_ *cobra.Command, _ []string) error {
 		PostEditChecks: fc.PostEditChecks,
 	})
 
+	if fc.PermissionMode != "" {
+		if strings.EqualFold(fc.PermissionMode, "plan") {
+			ag.SetPlanMode(true)
+		} else if mode, ok := agent.ParseMode(fc.PermissionMode); ok {
+			ag.SetMode(mode)
+		} else {
+			logger.L.Warn("unknown permission_mode in config, using default", "value", fc.PermissionMode)
+		}
+	}
+
+	// ── TUI ─────────────────────────────────────────────────────────────────────────────────
 	model, err := tui.NewModel(ag, activeSession, cfg.SystemPrompt, version, string(cfg.Provider), cfg.Model, cfg.Persona)
 	if err != nil {
 		logger.L.Error("TUI init failed", "error", err)
@@ -361,3 +398,9 @@ func askTrust(path, effect string) bool {
 
 // stdinReader is shared so consecutive prompts don't lose buffered input.
 var stdinReader = bufio.NewReader(os.Stdin)
+
+// isTerminal reports whether f is a character device (a TTY).
+func isTerminal(f *os.File) bool {
+	st, err := f.Stat()
+	return err == nil && st.Mode()&os.ModeCharDevice != 0
+}

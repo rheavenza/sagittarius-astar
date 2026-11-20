@@ -93,6 +93,9 @@ type FileConfig struct {
 	// confirmed edit: file extension → shell command with {file} / {dir}
 	// placeholders, or "off" to disable. e.g. {".ts": "npx tsc --noEmit -p {dir}"}
 	PostEditChecks map[string]string `json:"post_edit_checks,omitempty"`
+	// PermissionMode is the startup mode: "ask" (default), "accept-edits",
+	// "auto" or "plan". Shift+Tab / /mode change it at runtime.
+	PermissionMode string            `json:"permission_mode,omitempty"`
 	Personas       map[string]string `json:"personas,omitempty"`
 	// MCPServers is an optional map of logical server names to their spawn configs.
 	// Leave empty (or omit) to run aig without any MCP servers.

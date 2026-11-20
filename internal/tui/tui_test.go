@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/agent"
 	"github.com/clitorhea/sagittarius-astar.git/internal/checkpoint"
@@ -400,5 +402,96 @@ func TestTUIGoOutsidePlanMode(t *testing.T) {
 	d.submit("/go")
 	if d.m.appState != stateInput || !strings.Contains(output(d.m), "Not in plan mode") {
 		t.Fatalf("unexpected: state=%d\n%s", d.m.appState, output(d.m))
+	}
+}
+
+// ── layout ───────────────────────────────────────────────────────────────────
+
+func frameLines(m Model) []string { return strings.Split(m.View(), "\n") }
+
+func TestFrameAlwaysFitsTerminal(t *testing.T) {
+	d := newDriver(t, &fakeProvider{replies: []scripted{
+		{calls: []llm.ToolCall{{ID: "c", Name: "run_command", Args: map[string]any{"command": "echo hi"}}}},
+		{tokens: []string{"ok"}},
+	}})
+	d.m.activeProvider = "nim"
+	d.m.activeModel = "mistralai/mistral-large-4-1t-a52b-instruct-very-long-name"
+	d.m.activeSession.Name = "A really long session title that goes on"
+	for i := 0; i < 80; i++ {
+		d.m.appendOutput(fmt.Sprintf("line %d", i))
+	}
+	d.m.refreshViewport()
+
+	check := func(label string) {
+		t.Helper()
+		for _, size := range [][2]int{{120, 40}, {80, 24}, {50, 20}, {40, 12}} {
+			d.send(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+			lines := frameLines(d.m)
+			if len(lines) != size[1] {
+				t.Errorf("%s @%dx%d: frame has %d lines", label, size[0], size[1], len(lines))
+			}
+			for i, l := range lines {
+				if w := lipgloss.Width(l); w > size[0] {
+					t.Errorf("%s @%dx%d: line %d is %d wide", label, size[0], size[1], i, w)
+					break
+				}
+			}
+			if h := lipgloss.Height(d.m.statusBar()); h != 1 {
+				t.Errorf("%s @%dx%d: status bar is %d lines", label, size[0], size[1], h)
+			}
+		}
+	}
+	check("input")
+	d.submit("run it")
+	d.runUntil("approval", func(m Model) bool { return m.appState == stateConfirmingCmd })
+	check("approval")
+	d.key(tea.KeyEnter)
+	d.runUntil("done", idle)
+	d.submit("/history")
+	check("selecting")
+}
+
+func TestScrollbarAndStickyScroll(t *testing.T) {
+	d := newDriver(t, &fakeProvider{})
+	for i := 0; i < 200; i++ {
+		d.m.appendOutput(fmt.Sprintf("line %d", i))
+	}
+	d.m.refreshViewport()
+	if !d.m.viewport.AtBottom() {
+		t.Fatal("should start at the bottom")
+	}
+	bar := scrollbarView(d.m.viewport)
+	if !strings.Contains(bar, "┃") || !strings.Contains(bar, "│") {
+		t.Fatalf("scrollbar missing thumb/track:\n%s", bar)
+	}
+
+	d.key(tea.KeyPgUp)
+	off := d.m.viewport.YOffset
+	d.m.appendOutput("new output while scrolled up")
+	d.m.refreshViewport()
+	if d.m.viewport.YOffset != off {
+		t.Errorf("view jumped while the user was reading (offset %d -> %d)", off, d.m.viewport.YOffset)
+	}
+	if !strings.Contains(d.m.statusBar(), "more below") {
+		t.Error("status bar should hint at more content below")
+	}
+	d.send(tea.KeyMsg{Type: tea.KeyCtrlEnd})
+	if !d.m.viewport.AtBottom() {
+		t.Error("Ctrl+End should jump to the bottom")
+	}
+}
+
+func TestShiftTabCyclesModes(t *testing.T) {
+	d := newDriver(t, &fakeProvider{})
+	want := []string{"accept edits", "auto", "plan", "ask"}
+	for _, w := range want {
+		d.key(tea.KeyShiftTab)
+		if !strings.Contains(reANSI.ReplaceAllString(d.m.modeBadge(), ""), w) {
+			t.Fatalf("after Shift+Tab badge = %q, want %q", d.m.modeBadge(), w)
+		}
+	}
+	d.submit("/mode edits")
+	if d.m.agent.Mode() != agent.ModeAcceptEdits || d.m.agent.PlanMode() {
+		t.Fatal("/mode edits not applied")
 	}
 }

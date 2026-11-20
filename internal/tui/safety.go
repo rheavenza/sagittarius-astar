@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/clitorhea/sagittarius-astar.git/internal/agent"
 	"github.com/clitorhea/sagittarius-astar.git/internal/checkpoint"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 )
@@ -132,6 +133,27 @@ func (m Model) handleSafetyCommand(input string) (Model, tea.Cmd, bool) {
 			m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("📝 Plan mode on"))
 			m = m.submitPrompt(arg)
 			return m, m.startTurn(), true
+		}
+
+	case "/mode":
+		switch arg {
+		case "":
+		case "plan":
+			m.agent.SetMode(agent.ModeDefault)
+			m.agent.SetPlanMode(true)
+		default:
+			mode, valid := agent.ParseMode(arg)
+			if !valid {
+				m.appendOutput(errorStyle.Render("✗ Unknown mode " + arg + ". Use: ask | edits | auto | plan"))
+				m.refreshViewport()
+				return m, nil, true
+			}
+			m.agent.SetPlanMode(false)
+			m.agent.SetMode(mode)
+		}
+		m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Render("Mode: " + modeDescription(m.agent.PlanMode(), m.agent.Mode())))
+		if arg == "" {
+			m.appendOutput(sub.Render("  Shift+Tab cycles ask → accept edits → auto → plan · /mode <ask|edits|auto|plan>"))
 		}
 
 	case "/go", "/approve-plan":

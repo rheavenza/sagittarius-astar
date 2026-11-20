@@ -273,7 +273,7 @@ func TestErrorLoopBreaker(t *testing.T) {
 	}
 }
 
-func TestWriteAlwaysAsksEvenWithAutoApprove(t *testing.T) {
+func TestWriteAsksInDefaultMode(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "x.json")
 	p := &fakeProvider{replies: []reply{
@@ -281,7 +281,6 @@ func TestWriteAlwaysAsksEvenWithAutoApprove(t *testing.T) {
 		{tokens: []string{"written"}},
 	}}
 	a := New(Options{Provider: p, WorkspaceRoot: dir})
-	a.SetAutoApprove(true)
 	asked := false
 	evs, msgs := collect(t, a.Run(context.Background(), user("write")), func(r *ApprovalRequest) {
 		asked = true
@@ -292,7 +291,7 @@ func TestWriteAlwaysAsksEvenWithAutoApprove(t *testing.T) {
 	})
 	done(t, evs)
 	if !asked {
-		t.Fatal("writes must always ask")
+		t.Fatal("writes must ask in the default mode")
 	}
 	if b, _ := os.ReadFile(f); string(b) != `{"a":1}` {
 		t.Fatalf("file not written: %q", b)
@@ -467,4 +466,66 @@ func TestPlanModeBlocksChangesAndOffersOnlyReadTools(t *testing.T) {
 func toolsRisk(name string) (string, bool) {
 	r, ok := tools.RiskOf(name)
 	return r.String(), ok
+}
+
+func TestAcceptEditsModeWritesInsideWorkspaceWithoutAsking(t *testing.T) {
+	dir := t.TempDir()
+	inside := filepath.Join(dir, "in.txt")
+	outside := filepath.Join(t.TempDir(), "out.txt")
+	p := &fakeProvider{replies: []reply{
+		{calls: []llm.ToolCall{
+			{ID: "1", Name: "write_file", Args: map[string]any{"path": inside, "content": "a"}},
+			{ID: "2", Name: "write_file", Args: map[string]any{"path": outside, "content": "b"}},
+			{ID: "3", Name: "run_command", Args: map[string]any{"command": "true"}},
+		}},
+		{tokens: []string{"ok"}},
+	}}
+	a := New(Options{Provider: p, WorkspaceRoot: dir})
+	a.SetMode(ModeAcceptEdits)
+	var asked []string
+	evs, _ := collect(t, a.Run(context.Background(), user("go")), func(r *ApprovalRequest) {
+		asked = append(asked, r.Call.ID)
+		r.Approve("")
+	})
+	done(t, evs)
+	if strings.Join(asked, ",") != "2,3" {
+		t.Fatalf("asked for %v, want only the outside write (2) and the command (3)", asked)
+	}
+}
+
+func TestAutoModeStillAsksForDestructiveCommands(t *testing.T) {
+	dir := t.TempDir()
+	p := &fakeProvider{replies: []reply{
+		{calls: []llm.ToolCall{
+			{ID: "1", Name: "run_command", Args: map[string]any{"command": "echo safe"}},
+			{ID: "2", Name: "run_command", Args: map[string]any{"command": "rm -rf " + filepath.Join(dir, "nothing")}},
+			{ID: "3", Name: "write_file", Args: map[string]any{"path": filepath.Join(dir, "f.txt"), "content": "x"}},
+		}},
+		{tokens: []string{"ok"}},
+	}}
+	a := New(Options{Provider: p, WorkspaceRoot: dir})
+	a.SetMode(ModeAuto)
+	var asked []*ApprovalRequest
+	evs, _ := collect(t, a.Run(context.Background(), user("go")), func(r *ApprovalRequest) {
+		asked = append(asked, r)
+		r.Deny()
+	})
+	done(t, evs)
+	if len(asked) != 1 || asked[0].Call.ID != "2" || !strings.Contains(asked[0].Title, "destructive") {
+		t.Fatalf("auto mode should ask only for rm -rf, asked: %+v", asked)
+	}
+	if !a.AutoApprove() {
+		t.Error("AutoApprove should report true in auto mode")
+	}
+}
+
+func TestParseMode(t *testing.T) {
+	for in, want := range map[string]Mode{"ask": ModeDefault, "edits": ModeAcceptEdits, "accept-edits": ModeAcceptEdits, "AUTO": ModeAuto, "yolo": ModeAuto} {
+		if got, ok := ParseMode(in); !ok || got != want {
+			t.Errorf("ParseMode(%q) = %v, %v", in, got, ok)
+		}
+	}
+	if _, ok := ParseMode("bogus"); ok {
+		t.Error("bogus mode accepted")
+	}
 }

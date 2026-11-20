@@ -280,7 +280,7 @@ func (m *Model) renderAssistant(msg llm.Message) {
 		}
 		m.outputLines = append(m.outputLines, strings.TrimRight(rendered, "\n"))
 	}
-	m.outputLines = append(m.outputLines, divider(m.width))
+	m.outputLines = append(m.outputLines, m.convDivider())
 }
 
 func toolIcon(name string) string {
@@ -344,6 +344,9 @@ func (m *Model) renderApproval(req *agent.ApprovalRequest) {
 	hint := lipgloss.NewStyle().Foreground(colorSubtext)
 	switch req.Kind {
 	case agent.ApproveCommand:
+		if req.Title != "run_command" {
+			m.appendOutput(errorStyle.Render(req.Title))
+		}
 		m.appendOutput(confirmStyle.Render("🔧 run_command: " + req.Command))
 		m.appendOutput(hint.Render("Enter to execute · edit the command if needed · Esc to skip · Ctrl+C to cancel the turn"))
 	case agent.ApproveSudoPassword:
@@ -428,8 +431,12 @@ func (m *Model) refreshViewportStreaming() {
 	} else if s.native.Len() == 0 && s.split.Reasoning() == "" {
 		b.WriteString(" " + spinnerStyle.Render("…"))
 	}
+	follow := m.stickBottom || m.viewport.AtBottom()
+	m.stickBottom = false
 	m.viewport.SetContent(b.String())
-	m.viewport.GotoBottom()
+	if follow {
+		m.viewport.GotoBottom()
+	}
 }
 
 // ── keys ─────────────────────────────────────────────────────────────────────
@@ -569,6 +576,10 @@ func (m *Model) handleScrollKeys(msg tea.KeyMsg) (bool, tea.Cmd) {
 		m.viewport.LineUp(1)
 	case msg.String() == "alt+down":
 		m.viewport.LineDown(1)
+	case msg.Type == tea.KeyCtrlEnd:
+		m.viewport.GotoBottom()
+	case msg.Type == tea.KeyCtrlHome:
+		m.viewport.GotoTop()
 	default:
 		return false, nil
 	}
@@ -580,7 +591,7 @@ func (m Model) viewTurnInput() string {
 	hint := lipgloss.NewStyle().Foreground(colorSubtext)
 	switch m.appState {
 	case stateConfirmingCmd:
-		return inputActiveStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
+		return m.activeBox(lipgloss.JoinVertical(lipgloss.Left,
 			confirmStyle.Render("Review command (Enter to run, Esc to skip, Shift+Enter for newline, Ctrl+C to cancel the turn):"),
 			m.cmdTextarea.View()))
 	case stateConfirmingWrite:
@@ -588,28 +599,28 @@ func (m Model) viewTurnInput() string {
 		if m.approval != nil && m.approval.Write != nil {
 			path = m.approval.Write.Path
 		}
-		return inputActiveStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
+		return m.activeBox(lipgloss.JoinVertical(lipgloss.Left,
 			confirmStyle.Render(fmt.Sprintf("💾 Write to %s? Type 'y' and Enter to confirm, Esc to reject:", path)),
 			m.cmdTextarea.View()))
 	case stateConfirmingTool:
-		return inputActiveStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
+		return m.activeBox(lipgloss.JoinVertical(lipgloss.Left,
 			confirmStyle.Render("Allow this tool call? Type 'y' and Enter to allow, Esc to deny:"),
 			m.cmdTextarea.View()))
 	case stateInputSudoPassword:
-		return inputActiveStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
+		return m.activeBox(lipgloss.JoinVertical(lipgloss.Left,
 			confirmStyle.Render("🔒 This command requires sudo. Enter password (Esc to cancel):"),
 			m.sudoTextInput.View()))
 	case stateRuntimeInput:
-		return inputActiveStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
+		return m.activeBox(lipgloss.JoinVertical(lipgloss.Left,
 			hint.Render("⌨️  Type a line to send to the running process (Enter to send · Esc to return)"),
 			m.runtimeInput.View()))
 	case stateExecutingTool:
 		elapsed := time.Since(m.execStart).Seconds()
 		if m.cancelling {
-			return inputStyle.Render(m.spinner.View() + " " + hint.Render("cancelling…"))
+			return m.idleBox(m.spinner.View() + " " + hint.Render("cancelling…"))
 		}
 		if m.currentTool == nil {
-			return inputStyle.Render(m.spinner.View() + " " + hint.Render("working…"))
+			return m.idleBox(m.spinner.View() + " " + hint.Render("working…"))
 		}
 		icon, desc := "⚙", "executing tool: "+m.currentTool.Call.Name+"…"
 		if m.currentTool.Call.Name == "run_command" {
@@ -624,7 +635,7 @@ func (m Model) viewTurnInput() string {
 		if m.stdin != nil {
 			keys = "Ctrl+I to send stdin · " + keys
 		}
-		return inputStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
+		return m.idleBox(lipgloss.JoinVertical(lipgloss.Left,
 			fmt.Sprintf("%s %s %s (elapsed: %.1fs)", m.spinner.View(), icon, desc, elapsed),
 			hint.Render(keys)))
 	}

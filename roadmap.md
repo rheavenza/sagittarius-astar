@@ -70,6 +70,18 @@ Prerequisite for headless mode, subagents and proper tests.
 - ✅ `/undo` (takes a redo point first, so nothing is lost), `/redo`, `/diff` (all changes
   since the session's first checkpoint), `/checkpoints`. The model is told about undo/redo so
   it re-reads files.
+- ✅ **Permission modes**, cycled with Shift+Tab or set with `/mode`:
+  - **ask**: approve every write, command and sensitive tool.
+  - **accept edits**: edits inside the workspace apply without asking.
+  - **auto**: everything runs without asking, except writes outside the workspace and
+    destructive commands (`rm -rf`, force-push, `mkfs`, `rpm-ostree rebase`…).
+  - **plan**.
+  Set the startup mode with `permission_mode` in config.
+- ✅ TUI: the frame is measured so it never exceeds the terminal (this fixes the duplicated
+  status bar and input box); the status bar never wraps; conversation scrollbar; the view
+  stays put while you read scrolled-up history; Ctrl+Home/End.
+- ✅ CLI: `aig version`, unknown arguments are rejected, and aig refuses to start the TUI
+  without a terminal (it used to hang when an agent ran it).
 - ✅ Plan mode: `/plan [task]` offers the model only read-only tools, blocks everything else,
   and asks for a numbered plan. `/go` approves it and starts the implementation.
 

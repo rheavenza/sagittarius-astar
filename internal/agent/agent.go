@@ -66,8 +66,47 @@ type Agent struct {
 	maxTokens      int
 	checkpoints    Checkpointer
 
-	autoApprove atomic.Bool
-	planMode    atomic.Bool
+	mode     atomic.Int32 // Mode
+	planMode atomic.Bool
+}
+
+// Mode is the permission mode: how much the agent may do without asking.
+type Mode int32
+
+const (
+	// ModeDefault asks before file writes, commands, MCP tools, web_fetch
+	// and reads outside the workspace.
+	ModeDefault Mode = iota
+	// ModeAcceptEdits applies file edits inside the workspace without
+	// asking; everything else behaves like ModeDefault.
+	ModeAcceptEdits
+	// ModeAuto runs everything without asking, except writes outside the
+	// workspace and destructive commands (tools.DangerousCommand).
+	ModeAuto
+)
+
+func (m Mode) String() string {
+	switch m {
+	case ModeAcceptEdits:
+		return "accept-edits"
+	case ModeAuto:
+		return "auto"
+	default:
+		return "default"
+	}
+}
+
+// ParseMode accepts "default"/"ask", "accept-edits"/"edits", "auto"/"yolo".
+func ParseMode(s string) (Mode, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "default", "ask", "normal", "off":
+		return ModeDefault, true
+	case "accept-edits", "acceptedits", "accept_edits", "edits":
+		return ModeAcceptEdits, true
+	case "auto", "yolo", "on":
+		return ModeAuto, true
+	}
+	return ModeDefault, false
 }
 
 // New creates an Agent.
@@ -108,12 +147,23 @@ func (a *Agent) SetContextBlock(s string) {
 	a.contextBlock = strings.TrimSpace(s)
 }
 
-// SetAutoApprove toggles running commands and sensitive tools without asking.
-// File writes always ask.
-func (a *Agent) SetAutoApprove(on bool) { a.autoApprove.Store(on) }
+// SetMode sets the permission mode (takes effect on the next tool call).
+func (a *Agent) SetMode(m Mode) { a.mode.Store(int32(m)) }
 
-// AutoApprove reports the auto-approve setting.
-func (a *Agent) AutoApprove() bool { return a.autoApprove.Load() }
+// Mode returns the permission mode.
+func (a *Agent) Mode() Mode { return Mode(a.mode.Load()) }
+
+// SetAutoApprove switches between ModeAuto (on) and ModeDefault (off).
+func (a *Agent) SetAutoApprove(on bool) {
+	if on {
+		a.SetMode(ModeAuto)
+	} else {
+		a.SetMode(ModeDefault)
+	}
+}
+
+// AutoApprove reports whether the agent is in ModeAuto.
+func (a *Agent) AutoApprove() bool { return a.Mode() == ModeAuto }
 
 // SetPlanMode toggles plan mode: the model may only use read-only tools and
 // is asked to produce a plan instead of making changes. Applies from the

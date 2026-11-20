@@ -75,6 +75,11 @@ func New(root, session string) *Manager {
 	if err != nil {
 		abs = root
 	}
+	// Resolve symlinks so paths compare equal to git's (e.g. /home is a
+	// symlink to /var/home on Fedora Atomic / Bazzite).
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = real
+	}
 	m := &Manager{root: abs, git: openGit(abs)}
 	m.SetSession(session)
 	return m
@@ -180,6 +185,9 @@ func (m *Manager) RecordWrite(path, original string, existed bool) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return
+	}
+	if real, err := filepath.EvalSymlinks(filepath.Dir(abs)); err == nil {
+		abs = filepath.Join(real, filepath.Base(abs))
 	}
 	st := &fileState{content: []byte(original), existed: existed, mode: 0o644}
 	if info, err := os.Stat(abs); err == nil {

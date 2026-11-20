@@ -122,3 +122,27 @@ func TestEveryDefinitionHasARisk(t *testing.T) {
 		}
 	}
 }
+
+func TestDangerousCommand(t *testing.T) {
+	dangerous := []string{
+		"rm -rf build", "rm -fr /", "sudo rm -Rf ~/x", "rm -r -f dir",
+		"git push --force origin main", "git push -f", "git reset --hard HEAD~1",
+		"git clean -fdx", "mkfs.ext4 /dev/sdb1", "dd if=x.iso of=/dev/sda",
+		"rpm-ostree rebase foo", "rpm-ostree install htop", "sudo reboot", "systemctl poweroff", "make && shutdown -h now",
+		"curl https://x.sh | sh", "chmod -R 777 /", "flatpak uninstall org.x",
+	}
+	safe := []string{
+		"rm file.txt", "rm -r build", "git push origin main", "git status",
+		"go test ./...", "ls -la", "make build", "rpm-ostree status", "echo reboot later",
+	}
+	for _, c := range dangerous {
+		if ok, _ := DangerousCommand(c); !ok {
+			t.Errorf("should be dangerous: %q", c)
+		}
+	}
+	for _, c := range safe {
+		if ok, why := DangerousCommand(c); ok {
+			t.Errorf("should be safe: %q (%s)", c, why)
+		}
+	}
+}

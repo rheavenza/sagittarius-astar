@@ -125,6 +125,14 @@ type Model struct {
 	// Rendered display content
 	outputLines []string
 
+	// stickBottom forces the next viewport refresh to scroll to the end
+	// (e.g. after the user sends a message). Otherwise the view only follows
+	// new output when it is already at the bottom.
+	stickBottom bool
+
+	// tokenEstimate caches the history size shown in the status bar.
+	tokenEstimate int
+
 	// Glamour renderer
 	renderer *glamour.TermRenderer
 
@@ -171,10 +179,7 @@ func NewModel(ag *agent.Agent, activeSession *session.Session, defaultSystemProm
 	pg.Width = 40
 
 	// Glamour renderer
-	renderer, err := glamour.NewTermRenderer(
-		glamour.WithStandardStyle("dark"),
-		glamour.WithWordWrap(0), // let viewport handle wrapping
-	)
+	renderer, err := newRenderer(0)
 	if err != nil {
 		return nil, fmt.Errorf("tui: failed to create glamour renderer: %w", err)
 	}
@@ -211,6 +216,7 @@ func NewModel(ag *agent.Agent, activeSession *session.Session, defaultSystemProm
 		activePersona:       personaName,
 		fileConfig:          config.LoadFileConfig(),
 	}
+	m.updateTokenEstimate()
 
 	return m, nil
 }
@@ -225,11 +231,10 @@ func (m Model) Init() tea.Cmd {
 
 // Update is the central message dispatcher.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	oldState := m.appState
 	concreteModel, cmd := m.update(msg)
-	if concreteModel.appState != oldState {
-		concreteModel.recalculateDimensions()
-	}
+	// Heights depend on what is rendered (state, wrapped labels, status
+	// bar), so re-measure after every update.
+	concreteModel.recalculateDimensions()
 	return concreteModel, cmd
 }
 
@@ -261,6 +266,15 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 				m.autocompletePrefix = ""
 			}
 			switch msg.Type {
+			case tea.KeyShiftTab:
+				m.cycleMode()
+				return m, nil
+			case tea.KeyCtrlEnd:
+				m.viewport.GotoBottom()
+				return m, nil
+			case tea.KeyCtrlHome:
+				m.viewport.GotoTop()
+				return m, nil
 			case tea.KeyTab:
 				currentText := m.textarea.Value()
 				if strings.HasPrefix(currentText, "/") {
@@ -276,6 +290,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						"/history",
 						"/load",
 						"/map",
+						"/mode",
 						"/model",
 						"/models",
 						"/new",
@@ -356,8 +371,8 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						m.appendOutput("  /provider <name>   Switch active provider (keeps history)")
 						m.appendOutput("  /persona           List available personas")
 						m.appendOutput("  /persona <name>    Switch system prompt persona")
-						m.appendOutput("  /approve-tools on  Auto-run commands, MCP tools, web_fetch and out-of-workspace reads")
-						m.appendOutput("  /approve-tools off Require confirmation per command (default)")
+						m.appendOutput("  /mode [ask|edits|auto|plan]  Permission mode (Shift+Tab cycles)")
+						m.appendOutput("  /approve-tools on|off        Shortcut for /mode auto | /mode ask")
 						m.appendOutput("  /undo, /redo       Revert / re-apply the agent's last turn of file changes")
 						m.appendOutput("  /diff              Show all changes since the session's first checkpoint")
 						m.appendOutput("  /checkpoints       List workspace checkpoints")
@@ -368,6 +383,8 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						m.appendOutput("  Enter              Send message")
 						m.appendOutput("  Shift+Enter        Insert newline")
 						m.appendOutput("  Ctrl+C             Cancel the running turn / quit")
+						m.appendOutput("  Shift+Tab          Cycle permission mode: ask → accept edits → auto → plan")
+						m.appendOutput("  PgUp/PgDn, wheel   Scroll the conversation (Ctrl+Home / Ctrl+End: top / bottom)")
 						m.appendOutput("  Ctrl+L             Clear viewport")
 						m.appendOutput("  ?                  Toggle this help overlay")
 						m.appendOutput("  /read(file)        Attach file content to next message")
@@ -685,11 +702,11 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						case "on", "1", "yes":
 							m.agent.SetAutoApprove(true)
 							m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
-								"⚡ Auto-approve enabled — commands, MCP tools, web_fetch and out-of-workspace reads run without prompting."))
+								"Mode: " + modeDescription(false, agent.ModeAuto)))
 						case "off", "0", "no":
 							m.agent.SetAutoApprove(false)
 							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
-								"✓ Auto-approve disabled — commands and sensitive tools require confirmation."))
+								"Mode: " + modeDescription(false, agent.ModeDefault)))
 						default:
 							status := "off"
 							if m.agent.AutoApprove() {
@@ -912,81 +929,6 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-// View renders the full TUI to a string.
-func (m Model) View() string {
-	if m.width == 0 {
-		return "Loading…"
-	}
-
-	var b strings.Builder
-
-	// Header banner.
-	b.WriteString(headerBanner(m.appVersion))
-	b.WriteString(divider(m.width))
-	b.WriteString("\n")
-
-	// Scrollable output viewport.
-	b.WriteString(m.viewport.View())
-	b.WriteString("\n")
-
-	// Status bar.
-	b.WriteString(m.statusBar())
-	b.WriteString("\n")
-
-	// Input area (hidden while confirming or executing).
-	switch m.appState {
-	case stateInput:
-		b.WriteString(inputActiveStyle.Render(m.textarea.View()))
-	case stateStreaming:
-		label := "streaming…"
-		if m.cancelling {
-			label = "cancelling…"
-		} else if m.isDeliberating {
-			label = "thinking…"
-		}
-		b.WriteString(inputStyle.Render(
-			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render(label),
-		))
-	case stateConfirmingCmd, stateConfirmingWrite, stateConfirmingTool, stateInputSudoPassword,
-		stateExecutingTool, stateRuntimeInput:
-		b.WriteString(m.viewTurnInput())
-	case stateSelecting:
-		var items []string
-		title := fmt.Sprintf("Select %s (Up/Down arrows to navigate, Enter to select, Esc to cancel):", m.selectionType)
-		items = append(items, confirmStyle.Render(title))
-
-		start := 0
-		end := len(m.selectionItems)
-		if len(m.selectionItems) > 4 {
-			start = m.selectionIdx - 1
-			if start < 0 {
-				start = 0
-			}
-			end = start + 4
-			if end > len(m.selectionItems) {
-				end = len(m.selectionItems)
-				start = end - 4
-			}
-		}
-
-		for i := start; i < end; i++ {
-			item := m.selectionItems[i]
-			marker := "  "
-			style := lipgloss.NewStyle().Foreground(colorText)
-			if i == m.selectionIdx {
-				marker = "▶ "
-				style = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
-			}
-			items = append(items, style.Render(fmt.Sprintf("%s%s", marker, item.Label)))
-		}
-		b.WriteString(inputActiveStyle.Render(
-			lipgloss.JoinVertical(lipgloss.Left, items...),
-		))
-	}
-
-	return b.String()
-}
-
 // handleSelection processes the interactive list selection.
 func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 	switch m.selectionType {
@@ -1172,7 +1114,7 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 			m.outputLines = append(m.outputLines,
 				systemLabelStyle.Render("⚙ System Context (Execution Feedback):"),
 				systemContentStyle.Render(msg.Content),
-				divider(m.width),
+				m.convDivider(),
 			)
 			continue
 		}
@@ -1182,7 +1124,7 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 			m.outputLines = append(m.outputLines,
 				label,
 				lipgloss.NewStyle().Foreground(colorText).Render(msg.Content),
-				divider(m.width),
+				m.convDivider(),
 			)
 		} else if msg.Role == llm.RoleAssistant {
 			if msg.Content != "" || msg.ReasoningContent != "" {
@@ -1200,7 +1142,7 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 					}
 					m.outputLines = append(m.outputLines, strings.TrimRight(rendered, "\n"))
 				}
-				m.outputLines = append(m.outputLines, divider(m.width))
+				m.outputLines = append(m.outputLines, m.convDivider())
 			}
 			// If there are tool calls in this assistant turn, render the completed ones.
 			for _, call := range msg.ToolCalls {
@@ -1247,7 +1189,7 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 				nextIsUser = true
 			}
 			if nextIsUser {
-				m.outputLines = append(m.outputLines, divider(m.width))
+				m.outputLines = append(m.outputLines, m.convDivider())
 			}
 		}
 	}
@@ -1291,61 +1233,9 @@ func (m *Model) getExecutionIndicator(cmd string) (string, string) {
 	return "⚙", "running command…"
 }
 
-// recalculateDimensions calculates dynamic layout heights and widths to prevent overflow or underflow.
-func (m *Model) recalculateDimensions() {
-	if m.width == 0 || m.height == 0 {
-		return
-	}
-	m.viewport.Width = m.width
-	m.textarea.SetWidth(m.width - 4)
-	m.cmdTextarea.SetWidth(m.width - 4)
-	m.sudoTextInput.Width = m.width - 4
-	m.runtimeInput.Width = m.width - 4
-
-	overhead := 7
-
-	inputHeight := 0
-	switch m.appState {
-	case stateInput:
-		inputHeight = 5
-	case stateStreaming:
-		inputHeight = 3
-	case stateConfirmingCmd:
-		inputHeight = 8
-	case stateConfirmingWrite, stateConfirmingTool:
-		inputHeight = 8
-	case stateInputSudoPassword:
-		inputHeight = 4
-	case stateExecutingTool:
-		inputHeight = 4
-	case stateRuntimeInput:
-		inputHeight = 4
-	case stateSelecting:
-		itemsCount := len(m.selectionItems)
-		if itemsCount > 4 {
-			itemsCount = 4
-		}
-		inputHeight = itemsCount + 3
-	default:
-		inputHeight = 5
-	}
-
-	m.viewport.Height = m.height - (overhead + inputHeight)
-	if m.viewport.Height < 5 {
-		m.viewport.Height = 5
-	}
-
-	if m.renderer != nil && m.width != m.lastRendererWidth {
-		m.renderer, _ = glamour.NewTermRenderer(
-			glamour.WithStandardStyle("dark"),
-			glamour.WithWordWrap(m.viewport.Width-4),
-		)
-		m.lastRendererWidth = m.width
-	}
-}
-
 // saveSession persists the active session history to disk.
 func (m *Model) saveSession() {
+	m.updateTokenEstimate()
 	if m.activeSession == nil {
 		return
 	}
@@ -1357,6 +1247,7 @@ func (m *Model) saveSession() {
 
 // submitPrompt adds the user's message to history and renders it in the viewport.
 func (m Model) submitPrompt(input string) Model {
+	m.stickBottom = true
 	// 1. Process /read(file) macros
 	reRead := regexp.MustCompile(`\/read\(([^)]+)\)`)
 	matches := reRead.FindAllStringSubmatch(input, -1)
@@ -1384,7 +1275,7 @@ func (m Model) submitPrompt(input string) Model {
 	m.outputLines = append(m.outputLines,
 		label,
 		lipgloss.NewStyle().Foreground(colorText).Render(input),
-		divider(m.width),
+		m.convDivider(),
 	)
 	return m
 }
@@ -1393,9 +1284,12 @@ func (m Model) submitPrompt(input string) Model {
 // to the bottom. Use this when new content has been appended (e.g. a new
 // message, command output, tool result).
 func (m *Model) refreshViewport() {
-	content := strings.Join(m.outputLines, "\n")
-	m.viewport.SetContent(content)
-	m.viewport.GotoBottom()
+	follow := m.stickBottom || m.viewport.AtBottom()
+	m.stickBottom = false
+	m.viewport.SetContent(strings.Join(m.outputLines, "\n"))
+	if follow {
+		m.viewport.GotoBottom()
+	}
 }
 
 // refreshViewportKeepPosition re-renders output lines into the viewport while
@@ -1420,99 +1314,6 @@ func (m *Model) refreshViewportKeepPosition() {
 // appendOutput adds a rendered line to the output history.
 func (m *Model) appendOutput(line string) {
 	m.outputLines = append(m.outputLines, line)
-}
-
-// statusBar renders the bottom status bar with state, session, token count, and model info.
-func (m Model) statusBar() string {
-	var statusText string
-	switch m.appState {
-	case stateStreaming:
-		if m.isDeliberating {
-			statusText = "● deliberating"
-		} else {
-			statusText = "● streaming"
-		}
-	case stateConfirmingCmd:
-		statusText = "⚠ awaiting confirmation"
-	case stateExecutingTool:
-		statusText = "⚙ executing tool"
-	case stateConfirmingWrite:
-		statusText = "💾 write pending"
-	case stateConfirmingTool:
-		statusText = "⚠ tool approval pending"
-	case stateInputSudoPassword:
-		statusText = "🔒 entering sudo password"
-	default:
-		statusText = "● ready"
-	}
-
-	// Session name
-	sessionInfo := ""
-	if m.activeSession != nil {
-		name := m.activeSession.Name
-		if name == "" {
-			name = "Untitled"
-		}
-		sessionInfo = fmt.Sprintf("[%s]", name)
-	}
-
-	// Estimated token count
-	tokenCount := llm.EstimateHistoryTokens(m.history)
-	tokenInfo := fmt.Sprintf("~%dk tokens", tokenCount/1000)
-	if tokenCount < 1000 {
-		tokenInfo = fmt.Sprintf("~%d tokens", tokenCount)
-	}
-
-	// Provider + model info
-	modelInfo := ""
-	if m.activeProvider != "" || m.activeModel != "" {
-		modelInfo = fmt.Sprintf("%s/%s", m.activeProvider, m.activeModel)
-	}
-
-	// Persona info
-	personaInfo := ""
-	if m.activePersona != "" {
-		personaInfo = fmt.Sprintf("🎨 %s", m.activePersona)
-	}
-
-	// Auto-approve badge
-	autoTag := ""
-	if m.agent.AutoApprove() {
-		autoTag = lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("⚡auto")
-	}
-
-	// Left side: status · session
-	leftText := statusText
-	if sessionInfo != "" {
-		leftText = fmt.Sprintf("%s · %s", statusText, sessionInfo)
-	}
-
-	// Right side: tokens · model · persona · auto badge · help hint
-	rightParts := []string{}
-	if tokenInfo != "" {
-		rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorSubtext).Render(tokenInfo))
-	}
-	if modelInfo != "" {
-		rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorOverlay).Render(modelInfo))
-	}
-	if personaInfo != "" {
-		rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorAccent).Render(personaInfo))
-	}
-	if autoTag != "" {
-		rightParts = append(rightParts, autoTag)
-	}
-	if m.agent.PlanMode() {
-		rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("📝plan"))
-	}
-	rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorSubtext).Render("? help"))
-	rightText := strings.Join(rightParts, " · ")
-
-	padding := m.width - lipgloss.Width(leftText) - lipgloss.Width(rightText) - 4
-	if padding < 0 {
-		padding = 0
-	}
-	spacer := strings.Repeat(" ", padding)
-	return statusBarStyle.Width(m.width).Render(leftText + spacer + rightText)
 }
 
 // helpOverlay returns a formatted help block to append to outputLines.
@@ -1543,8 +1344,8 @@ func helpOverlay() string {
 		"  /persona        List personas",
 		"  /persona <n>    Switch system prompt persona",
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  Agent Execution"),
-		"  /approve-tools on   Auto-run commands and sensitive tools without prompting",
-		"  /approve-tools off  Require confirmation for every command (default)",
+		"  Shift+Tab           Cycle mode: ask → accept edits → auto → plan",
+		"  /mode <m>           Set mode: ask | edits | auto | plan",
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  Safety net"),
 		"  /undo, /redo        Revert / re-apply the last turn's changes",
 		"  /diff               Changes since the session's first checkpoint",
@@ -1554,4 +1355,12 @@ func helpOverlay() string {
 		"  /read(path)     Attach file content to next message",
 	}
 	return strings.Join(lines, "\n")
+}
+
+// newRenderer builds the markdown renderer; wrap 0 disables wrapping.
+func newRenderer(wrap int) (*glamour.TermRenderer, error) {
+	return glamour.NewTermRenderer(
+		glamour.WithStandardStyle("dark"),
+		glamour.WithWordWrap(max(wrap, 0)),
+	)
 }

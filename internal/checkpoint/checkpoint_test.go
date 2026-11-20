@@ -238,3 +238,21 @@ func TestNewCheckpointClearsRedo(t *testing.T) {
 		t.Fatal("a new checkpoint must clear redo")
 	}
 }
+
+func TestSymlinkedWorkspaceReportsRelativePaths(t *testing.T) {
+	dir := gitRepoFixture(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Skip("symlinks unavailable")
+	}
+	m := New(link, "sym")
+	m.Checkpoint("turn")
+	write(t, filepath.Join(link, "tracked.txt"), "changed\n")
+	res, err := m.Undo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Restored) != 1 || res.Restored[0] != "tracked.txt" {
+		t.Fatalf("restored = %v, want [tracked.txt] (no ../ paths)", res.Restored)
+	}
+}

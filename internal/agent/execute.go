@@ -11,6 +11,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 	"github.com/clitorhea/sagittarius-astar.git/internal/sandbox"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tools"
+	"github.com/clitorhea/sagittarius-astar.git/internal/workspace"
 )
 
 // outcome is the result of executing one tool call.
@@ -45,11 +46,11 @@ func (t *turn) ask(ctx context.Context, req *ApprovalRequest) (ApprovalReply, bo
 
 // execute applies the approval policy and runs one tool call.
 //
-// Policy:
-//   - file writes always ask (diff preview);
-//   - run_command asks unless auto-approve is on;
-//   - MCP tools ask unless their server is trusted or auto-approve is on;
-//   - web_fetch and reads outside the workspace ask unless auto-approve is on;
+// Policy by permission mode (see Mode):
+//   - file writes ask, except inside the workspace in accept-edits/auto mode;
+//   - run_command asks, except in auto mode (destructive commands still ask);
+//   - MCP tools ask unless their server is trusted or in auto mode;
+//   - web_fetch and reads outside the workspace ask unless in auto mode;
 //   - other read-only tools run directly.
 func (t *turn) execute(ctx context.Context, call llm.ToolCall) outcome {
 	a := t.a
@@ -114,16 +115,25 @@ func (t *turn) write(ctx context.Context, call llm.ToolCall) outcome {
 		return outcome{err: err}
 	}
 
-	req := newRequest(&ApprovalRequest{Kind: ApproveWrite, Call: call, Title: call.Name + ": " + pw.Path, Write: pw, Risk: tools.RiskWrite})
-	if _, ok := t.ask(ctx, req); !ok {
-		return deniedOutcome("The user rejected this file change. Do not retry it without asking the user.")
+	mode := t.a.Mode()
+	auto := (mode == ModeAcceptEdits || mode == ModeAuto) &&
+		t.a.workspaceRoot != "" && workspace.IsInside(t.a.workspaceRoot, pw.Path)
+	if !auto {
+		title := call.Name + ": " + pw.Path
+		if mode != ModeDefault {
+			title += " (outside the workspace)"
+		}
+		req := newRequest(&ApprovalRequest{Kind: ApproveWrite, Call: call, Title: title, Write: pw, Risk: tools.RiskWrite})
+		if _, ok := t.ask(ctx, req); !ok {
+			return deniedOutcome("The user rejected this file change. Do not retry it without asking the user.")
+		}
 	}
 
 	t.ensureCheckpoint()
 	if cp := t.a.checkpoints; cp != nil {
 		cp.RecordWrite(pw.Path, pw.Original, pw.Existed)
 	}
-	t.emit(ToolStartEvent{Call: call})
+	t.emit(ToolStartEvent{Call: call, Auto: auto})
 	if err := tools.CommitWrite(*pw); err != nil {
 		return outcome{err: err}
 	}
@@ -147,8 +157,15 @@ func (t *turn) runCommand(ctx context.Context, call llm.ToolCall, auto bool) out
 	}
 	command := original
 
+	title := "run_command"
+	if auto {
+		if bad, reason := tools.DangerousCommand(command); bad {
+			auto = false
+			title = "⚠ destructive command (" + reason + ") — confirmation required even in auto mode"
+		}
+	}
 	if !auto {
-		req := newRequest(&ApprovalRequest{Kind: ApproveCommand, Call: call, Title: "run_command", Command: command, Risk: tools.RiskExec})
+		req := newRequest(&ApprovalRequest{Kind: ApproveCommand, Call: call, Title: title, Command: command, Risk: tools.RiskExec})
 		rep, ok := t.ask(ctx, req)
 		if !ok {
 			return deniedOutcome("Command skipped by user.")
