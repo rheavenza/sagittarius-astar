@@ -239,6 +239,11 @@ func (m Model) finishTurn(ev agent.DoneEvent) (Model, tea.Cmd) {
 		m.appendOutput(errorStyle.Render("✗ Turn cancelled."))
 	}
 
+	if ev.Err == nil && !ev.Aborted && m.agent.PlanMode() {
+		m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
+			"📝 Plan mode: review the plan above — /go to implement it, keep chatting to refine it, /plan off to exit."))
+	}
+
 	var titleCmd tea.Cmd
 	if ev.Err == nil && !ev.Aborted && m.activeSession != nil && m.activeSession.Name == "Untitled" && !m.titleGenerated {
 		m.titleGenerated = true

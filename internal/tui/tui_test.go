@@ -14,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/agent"
+	"github.com/clitorhea/sagittarius-astar.git/internal/checkpoint"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/session"
 )
@@ -74,12 +75,14 @@ func newDriver(t *testing.T, p llm.Provider) *driver {
 	}
 	root := t.TempDir()
 	t.Chdir(root)
-	ag := agent.New(agent.Options{Provider: p, WorkspaceRoot: root})
+	cp := checkpoint.New(root, "test-session")
+	ag := agent.New(agent.Options{Provider: p, WorkspaceRoot: root, Checkpoints: cp})
 	sess := &session.Session{ID: "test-session", Name: "Untitled", History: []llm.Message{{Role: llm.RoleSystem, Content: "sys"}}}
 	mp, err := NewModel(ag, sess, "sys", "test", "gemini", "test-model", "coder")
 	if err != nil {
 		t.Fatal(err)
 	}
+	mp.SetCheckpoints(cp)
 	d := &driver{t: t, m: *mp}
 	d.send(tea.WindowSizeMsg{Width: 100, Height: 40})
 	return d
@@ -302,4 +305,100 @@ func TestTUITitleFallsBackWhenGenerationFails(t *testing.T) {
 	d := newDriver(t, p)
 	d.submit("explain the agent package please")
 	d.runUntil("fallback title", func(m Model) bool { return m.activeSession.Name == "explain the agent package please" })
+}
+
+// ── safety net ───────────────────────────────────────────────────────────────
+
+func TestTUIUndoRedoAgentWrite(t *testing.T) {
+	d := newDriver(t, nil)
+	target := filepath.Join(d.m.agentRootForTest(), "made-by-agent.txt")
+	d.m.agent.SetProvider(&fakeProvider{replies: []scripted{
+		{calls: []llm.ToolCall{{ID: "w1", Name: "write_file", Args: map[string]any{"path": target, "content": "hello"}}}},
+		{tokens: []string{"written"}},
+	}})
+	d.submit("create the file")
+	d.runUntil("write approval", func(m Model) bool { return m.appState == stateConfirmingWrite })
+	d.key(tea.KeyEnter) // prefilled "y"
+	d.runUntil("turn done", idle)
+	if read, _ := os.ReadFile(target); string(read) != "hello" {
+		t.Fatal("approved write not committed")
+	}
+	if !strings.Contains(output(d.m), "Checkpoint saved") {
+		t.Errorf("checkpoint notice missing:\n%s", output(d.m))
+	}
+
+	d.submit("/undo")
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatal("/undo did not remove the file the agent created")
+	}
+	last := d.m.history[len(d.m.history)-1]
+	if last.Role != llm.RoleSystem || !strings.Contains(last.Content, "/undo") {
+		t.Errorf("model not told about the undo: %+v", last)
+	}
+
+	d.submit("/redo")
+	if read, _ := os.ReadFile(target); string(read) != "hello" {
+		t.Fatal("/redo did not restore the file")
+	}
+
+	d.submit("/checkpoints")
+	if !strings.Contains(output(d.m), "create the file") {
+		t.Errorf("checkpoint list missing the turn:\n%s", output(d.m))
+	}
+	d.submit("/diff")
+	if !strings.Contains(output(d.m), "made-by-agent.txt") {
+		t.Errorf("diff missing the file:\n%s", output(d.m))
+	}
+}
+
+func TestTUIPlanModeThenGo(t *testing.T) {
+	d := newDriver(t, nil)
+	target := filepath.Join(d.m.agentRootForTest(), "x.txt")
+	write := llm.ToolCall{ID: "w", Name: "write_file", Args: map[string]any{"path": target, "content": "x"}}
+	d.m.agent.SetProvider(&fakeProvider{replies: []scripted{
+		{calls: []llm.ToolCall{write}},
+		{tokens: []string{"1. create x.txt"}},
+		{calls: []llm.ToolCall{func() llm.ToolCall { w := write; w.ID = "w2"; return w }()}},
+		{tokens: []string{"done"}},
+	}})
+
+	d.submit("/plan add x.txt")
+	if !d.m.agent.PlanMode() {
+		t.Fatal("plan mode not enabled")
+	}
+	d.runUntil("plan turn done", idle)
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatal("plan mode allowed a write")
+	}
+	if !strings.Contains(output(d.m), "/go to implement") {
+		t.Errorf("plan hint missing:\n%s", output(d.m))
+	}
+
+	d.submit("/go")
+	if d.m.agent.PlanMode() {
+		t.Fatal("/go must leave plan mode")
+	}
+	d.runUntil("write approval after /go", func(m Model) bool { return m.appState == stateConfirmingWrite })
+	d.key(tea.KeyEnter)
+	d.runUntil("implementation done", idle)
+	if _, err := os.Stat(target); err != nil {
+		t.Fatal("approved implementation did not write the file")
+	}
+	found := false
+	for _, m := range d.m.history {
+		if m.Role == llm.RoleUser && m.Content == planApprovedPrompt {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("approval prompt not sent")
+	}
+}
+
+func TestTUIGoOutsidePlanMode(t *testing.T) {
+	d := newDriver(t, &fakeProvider{})
+	d.submit("/go")
+	if d.m.appState != stateInput || !strings.Contains(output(d.m), "Not in plan mode") {
+		t.Fatalf("unexpected: state=%d\n%s", d.m.appState, output(d.m))
+	}
 }

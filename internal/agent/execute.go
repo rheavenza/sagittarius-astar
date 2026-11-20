@@ -55,6 +55,13 @@ func (t *turn) execute(ctx context.Context, call llm.ToolCall) outcome {
 	a := t.a
 	auto := a.AutoApprove()
 
+	if t.planMode {
+		risk, known := tools.RiskOf(call.Name)
+		if !known || risk >= tools.RiskWrite {
+			return deniedOutcome("Plan mode is active: only read-only tools may be used. Finish investigating and present your plan; changes are made after the user approves it with /go.")
+		}
+	}
+
 	if a.mcp != nil && a.mcp.IsMCPTool(call.Name) {
 		asked := !auto && !a.mcp.IsTrusted(call.Name)
 		if asked {
@@ -63,6 +70,7 @@ func (t *turn) execute(ctx context.Context, call llm.ToolCall) outcome {
 				return deniedOutcome(deniedToolMsg)
 			}
 		}
+		t.ensureCheckpoint()
 		t.emit(ToolStartEvent{Call: call, Auto: !asked})
 		res, err := a.mcp.Call(ctx, call.Name, call.Args)
 		return outcome{result: res, err: err}
@@ -111,6 +119,10 @@ func (t *turn) write(ctx context.Context, call llm.ToolCall) outcome {
 		return deniedOutcome("The user rejected this file change. Do not retry it without asking the user.")
 	}
 
+	t.ensureCheckpoint()
+	if cp := t.a.checkpoints; cp != nil {
+		cp.RecordWrite(pw.Path, pw.Original, pw.Existed)
+	}
 	t.emit(ToolStartEvent{Call: call})
 	if err := tools.CommitWrite(*pw); err != nil {
 		return outcome{err: err}
@@ -168,6 +180,7 @@ func (t *turn) runCommand(ctx context.Context, call llm.ToolCall, auto bool) out
 	}
 	run.Args["command"] = command
 
+	t.ensureCheckpoint()
 	pipeR, pipeW := io.Pipe()
 	defer pipeW.Close()
 	t.emit(ToolStartEvent{Call: run, Command: command, Stdin: pipeW, Auto: auto})

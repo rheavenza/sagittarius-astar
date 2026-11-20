@@ -25,6 +25,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/agent"
+	"github.com/clitorhea/sagittarius-astar.git/internal/checkpoint"
 	"github.com/clitorhea/sagittarius-astar.git/internal/config"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
@@ -248,7 +249,10 @@ func runChat(_ *cobra.Command, _ []string) error {
 	// ── TUI ─────────────────────────────────────────────────────────────────────────────────
 	// ── Agent ───────────────────────────────────────────────────────────────────────────────
 	cwd, _ := os.Getwd()
+	checkpoints := checkpoint.New(cwd, activeSession.ID)
+	logger.L.Info("checkpoints enabled", "mode", checkpoints.Mode())
 	ag := agent.New(agent.Options{
+		Checkpoints:    checkpoints,
 		Provider:       provider,
 		MCP:            mcpRegistry,
 		WorkspaceRoot:  cwd,
@@ -261,6 +265,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 		logger.L.Error("TUI init failed", "error", err)
 		return fmt.Errorf("failed to initialize TUI: %w", err)
 	}
+	model.SetCheckpoints(checkpoints)
 
 	p := tea.NewProgram(
 		model,

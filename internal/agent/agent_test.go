@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
+	"github.com/clitorhea/sagittarius-astar.git/internal/tools"
 )
 
 // ── fake provider ────────────────────────────────────────────────────────────
@@ -336,4 +337,134 @@ func TestWithContextBlock(t *testing.T) {
 	if out = WithContextBlock(h[1:], "# Env"); out[0].Role != llm.RoleSystem || len(out) != 2 {
 		t.Fatalf("expected a new system message: %+v", out)
 	}
+}
+
+// ── checkpoints & plan mode ──────────────────────────────────────────────────
+
+type fakeCheckpointer struct {
+	mu      sync.Mutex
+	labels  []string
+	records []string
+}
+
+func (f *fakeCheckpointer) Checkpoint(label string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.labels = append(f.labels, label)
+	return nil
+}
+
+func (f *fakeCheckpointer) RecordWrite(path, _ string, _ bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.records = append(f.records, path)
+}
+
+func TestCheckpointOncePerTurnBeforeFirstChange(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "a.txt")
+	p := &fakeProvider{replies: []reply{
+		{calls: []llm.ToolCall{{ID: "r", Name: "read_file", Args: map[string]any{"path": f}}}}, // no checkpoint for reads
+		{calls: []llm.ToolCall{
+			{ID: "w", Name: "write_file", Args: map[string]any{"path": f, "content": "x"}},
+			{ID: "c", Name: "run_command", Args: map[string]any{"command": "true"}},
+		}},
+		{tokens: []string{"done"}},
+	}}
+	cp := &fakeCheckpointer{}
+	a := New(Options{Provider: p, WorkspaceRoot: dir, Checkpoints: cp})
+	evs, _ := collect(t, a.Run(context.Background(), user("change a.txt please")), nil)
+	done(t, evs)
+
+	if len(cp.labels) != 1 || cp.labels[0] != "change a.txt please" {
+		t.Fatalf("checkpoints = %v, want exactly one labelled with the user message", cp.labels)
+	}
+	if len(cp.records) != 1 || cp.records[0] != f {
+		t.Fatalf("recorded writes = %v", cp.records)
+	}
+}
+
+func TestNoCheckpointForReadOnlyTurn(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	p := &fakeProvider{replies: []reply{
+		{calls: []llm.ToolCall{{ID: "1", Name: "list_directory", Args: map[string]any{}}}},
+		{tokens: []string{"ok"}},
+	}}
+	cp := &fakeCheckpointer{}
+	evs, _ := collect(t, New(Options{Provider: p, WorkspaceRoot: dir, Checkpoints: cp}).Run(context.Background(), user("look")), nil)
+	done(t, evs)
+	if len(cp.labels) != 0 {
+		t.Fatalf("read-only turn must not checkpoint: %v", cp.labels)
+	}
+}
+
+// recordingProvider captures the tool definitions offered to the model.
+type recordingProvider struct {
+	fakeProvider
+	defs [][]string
+}
+
+func (r *recordingProvider) StreamChat(ctx context.Context, msgs []llm.Message, defs []llm.Tool, ch chan<- string) ([]llm.ToolCall, string, error) {
+	var names []string
+	for _, d := range defs {
+		names = append(names, d.Name)
+	}
+	r.mu.Lock()
+	r.defs = append(r.defs, names)
+	r.mu.Unlock()
+	return r.fakeProvider.StreamChat(ctx, msgs, defs, ch)
+}
+
+func TestPlanModeBlocksChangesAndOffersOnlyReadTools(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "a.txt")
+	p := &recordingProvider{fakeProvider: fakeProvider{replies: []reply{
+		{calls: []llm.ToolCall{
+			{ID: "w", Name: "write_file", Args: map[string]any{"path": f, "content": "x"}},
+			{ID: "c", Name: "run_command", Args: map[string]any{"command": "touch " + f}},
+		}},
+		{tokens: []string{"1. Edit a.txt\n2. Run tests"}},
+	}}}
+	cp := &fakeCheckpointer{}
+	a := New(Options{Provider: p, WorkspaceRoot: dir, Checkpoints: cp})
+	a.SetPlanMode(true)
+	evs, msgs := collect(t, a.Run(context.Background(), user("plan it")), func(r *ApprovalRequest) {
+		t.Fatalf("plan mode must not ask for approvals: %+v", r)
+	})
+	done(t, evs)
+	assertAllCallsAnswered(t, msgs)
+
+	if _, err := os.Stat(f); !os.IsNotExist(err) {
+		t.Fatal("plan mode allowed a change")
+	}
+	for _, m := range msgs[1:3] {
+		if !strings.Contains(m.Content, "Plan mode is active") {
+			t.Errorf("blocked call result = %q", m.Content)
+		}
+	}
+	for _, name := range p.defs[0] {
+		if r, _ := toolsRisk(name); r != "read" && r != "network" {
+			t.Errorf("plan mode offered %s", name)
+		}
+	}
+	if !strings.Contains(p.requests[0][0].Content, "Plan mode (active)") {
+		t.Error("plan directive not sent")
+	}
+	if len(cp.labels) != 0 {
+		t.Error("plan mode must not checkpoint")
+	}
+
+	// Leaving plan mode restores the full toolset.
+	a.SetPlanMode(false)
+	p.replies = []reply{{tokens: []string{"ok"}}}
+	collect(t, a.Run(context.Background(), user("go")), nil)
+	if len(p.defs[len(p.defs)-1]) <= len(p.defs[0]) {
+		t.Error("full toolset not restored after plan mode")
+	}
+}
+
+func toolsRisk(name string) (string, bool) {
+	r, ok := tools.RiskOf(name)
+	return r.String(), ok
 }

@@ -40,6 +40,17 @@ type Options struct {
 	ContextBlock     string        // appended to the system prompt of each request
 	PostEditChecks   map[string]string
 	MaxContextTokens int
+	// Checkpoints, if set, snapshots the workspace before the first change
+	// of each turn (write, command, or MCP call) so it can be undone.
+	Checkpoints Checkpointer
+}
+
+// Checkpointer saves restorable workspace state (see internal/checkpoint).
+type Checkpointer interface {
+	// Checkpoint records the current workspace before a turn changes it.
+	Checkpoint(label string) error
+	// RecordWrite remembers a file's content before an agent write.
+	RecordWrite(path, original string, existed bool)
 }
 
 // Agent holds session-level state shared by turns. It is safe for concurrent
@@ -53,8 +64,10 @@ type Agent struct {
 	workspaceRoot  string
 	postEditChecks map[string]string
 	maxTokens      int
+	checkpoints    Checkpointer
 
 	autoApprove atomic.Bool
+	planMode    atomic.Bool
 }
 
 // New creates an Agent.
@@ -69,6 +82,7 @@ func New(o Options) *Agent {
 		workspaceRoot:  o.WorkspaceRoot,
 		postEditChecks: o.PostEditChecks,
 		maxTokens:      o.MaxContextTokens,
+		checkpoints:    o.Checkpoints,
 	}
 }
 
@@ -101,6 +115,23 @@ func (a *Agent) SetAutoApprove(on bool) { a.autoApprove.Store(on) }
 // AutoApprove reports the auto-approve setting.
 func (a *Agent) AutoApprove() bool { return a.autoApprove.Load() }
 
+// SetPlanMode toggles plan mode: the model may only use read-only tools and
+// is asked to produce a plan instead of making changes. Applies from the
+// next turn.
+func (a *Agent) SetPlanMode(on bool) { a.planMode.Store(on) }
+
+// PlanMode reports whether plan mode is on.
+func (a *Agent) PlanMode() bool { return a.planMode.Load() }
+
+// planDirective is appended to the system prompt in plan mode.
+const planDirective = `# Plan mode (active)
+The user enabled plan mode. Investigate as needed with read-only tools (read_file, find_files, search_regex, list_directory, map_workspace, web_search, web_fetch), but do NOT modify files, run commands, or call MCP tools — those calls are blocked.
+Then reply with a concise, numbered implementation plan:
+1. the files you will change and what changes in each,
+2. how you will verify the result (build, tests, manual checks),
+3. risks, assumptions and open questions.
+The user will review the plan and approve it with /go before anything is changed.`
+
 func (a *Agent) cachedSudoPassword() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -126,6 +157,10 @@ func (a *Agent) Run(ctx context.Context, history []llm.Message) <-chan Event {
 		contextBlock: a.contextBlock,
 		history:      append([]llm.Message(nil), history...),
 		ch:           ch,
+		planMode:     a.planMode.Load(),
+	}
+	if t.planMode {
+		t.contextBlock = strings.TrimSpace(t.contextBlock + "\n\n" + planDirective)
 	}
 	a.mu.Unlock()
 
@@ -151,6 +186,32 @@ type turn struct {
 	lastName, lastHash string
 	sameCount          int
 	errCount           int
+
+	planMode     bool
+	checkpointed bool // a checkpoint was taken this turn
+}
+
+// ensureCheckpoint snapshots the workspace before the first change of the
+// turn. Failure is reported but doesn't block the change.
+func (t *turn) ensureCheckpoint() {
+	cp := t.a.checkpoints
+	if cp == nil || t.checkpointed {
+		return
+	}
+	t.checkpointed = true
+	label := "agent turn"
+	for i := len(t.history) - 1; i >= 0; i-- {
+		if t.history[i].Role == llm.RoleUser {
+			label = t.history[i].Content
+			break
+		}
+	}
+	if err := cp.Checkpoint(label); err != nil {
+		logger.L.Warn("agent: checkpoint failed", "error", err)
+		t.emit(NoticeEvent{Level: NoticeWarn, Text: "Checkpoint failed (/undo won't cover this turn): " + err.Error()})
+		return
+	}
+	t.emit(NoticeEvent{Level: NoticeInfo, Text: "📌 Checkpoint saved — /undo reverts this turn's changes"})
 }
 
 func (t *turn) emit(e Event) { t.ch <- e }
@@ -209,7 +270,9 @@ func (t *turn) stream(ctx context.Context) (text, reasoning string, calls []llm.
 	pruned := llm.PruneHistory(t.history, t.a.maxTokens)
 	outgoing := WithContextBlock(pruned, t.contextBlock)
 	defs := tools.Definitions()
-	if t.a.mcp != nil {
+	if t.planMode {
+		defs = readOnlyDefs(defs)
+	} else if t.a.mcp != nil {
 		defs = append(defs, t.a.mcp.LLMTools()...)
 	}
 
@@ -347,4 +410,15 @@ func hashArguments(args map[string]any) string {
 	}
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
+}
+
+// readOnlyDefs keeps only tools that cannot change anything (plan mode).
+func readOnlyDefs(defs []llm.Tool) []llm.Tool {
+	out := defs[:0:0]
+	for _, d := range defs {
+		if r, ok := tools.RiskOf(d.Name); ok && (r == tools.RiskRead || r == tools.RiskNetwork) {
+			out = append(out, d)
+		}
+	}
+	return out
 }

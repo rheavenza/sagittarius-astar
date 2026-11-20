@@ -60,10 +60,18 @@ Prerequisite for headless mode, subagents and proper tests.
 - ✅ Fixed: `run_command` could hang after the command finished, because exec waited on the
   open stdin pipe.
 
-## Phase 4 — Safety net ⬜
-- ⬜ Git checkpoints before the first agent edit of each turn (hidden refs, no impact on your index).
-- ⬜ `/undo`, `/diff` (everything the agent changed this session).
-- ⬜ Plan mode: only read tools allowed until you approve the plan.
+## Phase 4 — Safety net ✅  *(branch `feat/safety-net`)*
+- ✅ **Checkpoints** before the agent's first change in each turn (a write, command or MCP call):
+  - In git repos, a snapshot commit of the work tree (tracked plus untracked files that aren't
+    ignored), built with a temporary index and stored as `refs/aig/checkpoints/<session>/<n>`.
+    Your index, HEAD and branches are never touched, and checkpoints survive restarts.
+    About 30 ms on this repo.
+  - Outside git, a journal of the original contents of files written by aig's edit tools.
+- ✅ `/undo` (takes a redo point first, so nothing is lost), `/redo`, `/diff` (all changes
+  since the session's first checkpoint), `/checkpoints`. The model is told about undo/redo so
+  it re-reads files.
+- ✅ Plan mode: `/plan [task]` offers the model only read-only tools, blocks everything else,
+  and asks for a numbered plan. `/go` approves it and starts the implementation.
 
 ## Phase 5 — Whole-project understanding ⬜
 - ⬜ **Repo map**: symbols and signatures per file (`go/parser` for Go, `ctags`/tree-sitter for

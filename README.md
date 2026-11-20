@@ -123,6 +123,15 @@ On first launch, `aig` generates a default `config.json` at:
 5. **Namespacing & approval**: Tools are exposed as `mcp__<server>__<tool>` so they never shadow built-ins. Each call asks for confirmation unless the server has `"trusted": true` or `/approve-tools on` is active.
 6. **Fault isolation**: A server that fails to start or to answer discovery is skipped; its stderr is written to the aig log.
 
+### Safety net: checkpoints, undo, plan mode
+- Before the agent's first change in a turn (a file write, command or MCP call), aig saves a **checkpoint**:
+  - In a git repo, it snapshots the whole working tree, tracked and untracked files that aren't ignored, into hidden refs `refs/aig/checkpoints/<session>/…`. Your index, HEAD and branches are never touched, and checkpoints survive restarts.
+  - Outside git, it keeps the original contents of the files written by aig's edit tools. Changes made by shell commands can't be undone there.
+- `/undo` restores the state before the last agent turn and saves a redo point first. `/redo` re-applies it. Repeated `/undo` walks further back.
+- `/diff` shows everything that changed since the session's first checkpoint. `/checkpoints` lists them.
+- `/plan [task]` turns on **plan mode**: the agent can only read and search, then replies with a numbered plan. `/go` approves it and the agent implements it; `/plan off` leaves plan mode.
+- To remove old checkpoint refs: `git for-each-ref --format='%(refname)' refs/aig/ | xargs -n1 git update-ref -d`
+
 ### Project context & instructions
 On startup aig builds a context block that is appended to the system prompt of every request (never stored in the session):
 - **Environment**: working dir, git root and branch, OS (with Bazzite/ostree hints), date, detected stack (`go.mod`, `package.json`, …), and useful CLI tools on PATH.
@@ -197,6 +206,10 @@ aig -r 20260521-170000
 | `/model` | List available models for the current active provider |
 | `/model <id>` | Switch the active model on-the-fly (keeps conversation history) |
 | `/models [filter]` | Pick a model from the provider's live list (NIM fetches its catalog), e.g. `/models qwen` |
+| `/undo` / `/redo` | Revert / re-apply the agent's last turn of file changes |
+| `/diff` | Show all changes since the session's first checkpoint |
+| `/checkpoints` | List workspace checkpoints |
+| `/plan [task]` / `/go` | Plan mode (read-only investigation → plan), then approve and implement |
 | `/provider` | List available providers |
 | `/provider <name>` | Switch the active provider on-the-fly (keeps conversation history) |
 | `/persona` | List available personas configured |

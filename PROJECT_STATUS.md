@@ -15,6 +15,7 @@ This file serves as a compressed "brain dump" for future AI agents working on th
 - **`internal/prompt/`**: environment block + instruction files (AGENTS.md…) appended to the system prompt.
 - **`internal/llm/`**: providers (Gemini, OpenAI-compatible DeepSeek/NIM), history pruning, `ThinkSplitter` for inline `<think>` reasoning.
 - **`internal/sandbox/`**: command execution (process groups, output caps, askpass sudo, stdin wiring).
+- **`internal/checkpoint/`**: workspace checkpoints (git snapshot commits under `refs/aig/checkpoints/<session>/`, or an in-memory journal outside git) backing `/undo`, `/redo`, `/diff`.
 - **`internal/mcp/`**, **`internal/config/`**, **`internal/session/`**: MCP host, configuration, persistence.
 
 ---
@@ -52,6 +53,8 @@ This file serves as a compressed "brain dump" for future AI agents working on th
 - **History ownership**: during a turn the agent owns the conversation; the TUI appends each `MessageEvent.Msg` to `m.history` in order and must not modify history while `m.events != nil`.
 - **Bubble Tea copies the Model by value**: keep `strings.Builder` / splitters behind pointers (`*streamState`).
 - **stdin for commands**: never hand `os/exec` a non-`*os.File` reader that stays open — use `sandbox.ExecuteWithStdin`, which wires an OS pipe (`attachStdin`).
+- **Checkpoints**: `agent.turn.ensureCheckpoint` runs once per turn right before the first mutation (after approval). Any new mutating tool must call it. Git snapshots must never touch the user's index: always use `GIT_INDEX_FILE` with a temp copy (`gitRepo.tempIndex`).
+- **Plan mode** is snapshotted per turn (`turn.planMode`); it filters tool definitions to read/network risk and denies everything else in `execute`.
 - **Bubble Tea State Changes**: Whenever the `appState` changes to something that alters the UI height (like opening the Runtime Input box), you MUST ensure `m.recalculateDimensions()` is called so the viewport resizes correctly.
 - **Loop breakers** are per turn (state on `agent.turn`), so they reset automatically for each user message.
 - **Every tool_call needs a result**: Any path that stops a tool batch early (loop breaker, user abort, denial, cancelled write/sudo) MUST append a tool message for each unanswered call (`answerRemainingToolCalls` / `skippedToolResults` in `internal/tui/toolflow.go`). OpenAI-compatible APIs return HTTP 400 otherwise.

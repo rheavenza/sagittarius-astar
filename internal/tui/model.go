@@ -27,6 +27,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/agent"
+	"github.com/clitorhea/sagittarius-astar.git/internal/checkpoint"
 	"github.com/clitorhea/sagittarius-astar.git/internal/config"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
@@ -95,6 +96,9 @@ type Model struct {
 
 	// fileConfig is the parsed config, for persona resolution.
 	fileConfig *config.FileConfig
+
+	// checkpoints backs /undo, /redo, /diff (nil if unavailable).
+	checkpoints *checkpoint.Manager
 
 	// providerFingerprint is provider|model|baseURL|apiKey of the live
 	// provider, so the client is only rebuilt when one of those changes.
@@ -262,7 +266,10 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 				if strings.HasPrefix(currentText, "/") {
 					var slashCommands = []string{
 						"/approve-tools",
+						"/checkpoints",
 						"/clear",
+						"/diff",
+						"/go",
 						"/delete",
 						"/exit",
 						"/help",
@@ -273,8 +280,11 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						"/models",
 						"/new",
 						"/persona",
+						"/plan",
 						"/provider",
 						"/quit",
+						"/redo",
+						"/undo",
 					}
 
 					// Start fresh or filter based on typed prefix
@@ -348,6 +358,11 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						m.appendOutput("  /persona <name>    Switch system prompt persona")
 						m.appendOutput("  /approve-tools on  Auto-run commands, MCP tools, web_fetch and out-of-workspace reads")
 						m.appendOutput("  /approve-tools off Require confirmation per command (default)")
+						m.appendOutput("  /undo, /redo       Revert / re-apply the agent's last turn of file changes")
+						m.appendOutput("  /diff              Show all changes since the session's first checkpoint")
+						m.appendOutput("  /checkpoints       List workspace checkpoints")
+						m.appendOutput("  /plan [task]       Plan mode: read-only investigation, then a plan (/plan off to exit)")
+						m.appendOutput("  /go                Approve the plan and implement it")
 						m.appendOutput("  /quit, /q          Exit the application")
 						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Keyboard shortcuts:"))
 						m.appendOutput("  Enter              Send message")
@@ -436,6 +451,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						m.history = m.activeSession.History
 						m.titleGenerated = false
 						m.outputLines = nil
+						m.syncCheckpointSession()
 						m.saveSession()
 						m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Started fresh session: " + m.activeSession.ID))
 						m.refreshViewport()
@@ -525,6 +541,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 							m.appendOutput(errorStyle.Render("✗ Failed to load session: " + err.Error()))
 						} else {
 							m.activeSession = s
+							m.syncCheckpointSession()
 							m.loadHistory(s.History, false)
 							m.titleGenerated = false
 							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Loaded session: " + s.ID))
@@ -683,6 +700,11 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						}
 						m.refreshViewport()
 						break
+					}
+
+					// Safety net: /undo /redo /diff /checkpoints /plan /go
+					if nm, cmd, ok := m.handleSafetyCommand(input); ok {
+						return nm, cmd
 					}
 
 					// Unknown command fallback
@@ -993,6 +1015,7 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.activeSession = s
+		m.syncCheckpointSession()
 		if s.Provider != "" {
 			m.activeProvider = s.Provider
 		}
@@ -1478,6 +1501,9 @@ func (m Model) statusBar() string {
 	if autoTag != "" {
 		rightParts = append(rightParts, autoTag)
 	}
+	if m.agent.PlanMode() {
+		rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("📝plan"))
+	}
 	rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorSubtext).Render("? help"))
 	rightText := strings.Join(rightParts, " · ")
 
@@ -1519,6 +1545,11 @@ func helpOverlay() string {
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  Agent Execution"),
 		"  /approve-tools on   Auto-run commands and sensitive tools without prompting",
 		"  /approve-tools off  Require confirmation for every command (default)",
+		lipgloss.NewStyle().Foreground(colorAccent).Render("  Safety net"),
+		"  /undo, /redo        Revert / re-apply the last turn's changes",
+		"  /diff               Changes since the session's first checkpoint",
+		"  /checkpoints        List checkpoints",
+		"  /plan [task]        Plan mode (read-only), then /go to implement",
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  File macros"),
 		"  /read(path)     Attach file content to next message",
 	}
