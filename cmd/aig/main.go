@@ -11,10 +11,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -107,6 +109,11 @@ func runChat(_ *cobra.Command, _ []string) error {
 		fmt.Fprintf(os.Stderr, "warning: logging disabled: %v\n", err)
 	}
 	defer cleanupLog()
+
+	// ── Local ./aig.md prompt (requires one-time consent per content hash) ───
+	if flagPersona == "" {
+		flagPersona = resolveLocalPrompt()
+	}
 
 	// ── Configuration ─────────────────────────────────────────────────────────
 	cfg, err := config.Load(config.ProviderName(flagProvider), flagModel, flagPersona)
@@ -203,6 +210,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 				Command: sc.Command,
 				Args:    sc.Args,
 				Env:     sc.Env,
+				Trusted: sc.Trusted,
 			}
 		}
 
@@ -263,11 +271,43 @@ func runChat(_ *cobra.Command, _ []string) error {
 	return nil
 }
 
-// coalesceEnv returns the value of the named environment variable if set,
-// otherwise returns the fallback string (e.g. from the config file).
-func coalesceEnv(envName, fallback string) string {
-	if v := os.Getenv(envName); v != "" {
-		return v
+// resolveLocalPrompt returns "aig.md" if a ./aig.md exists and the user has
+// approved its current content (now or previously); otherwise "".
+//
+// Any repository could ship an aig.md, so it is never used silently: the
+// first time (and whenever its content changes) the user is asked on the
+// terminal before the TUI starts.
+func resolveLocalPrompt() string {
+	info, err := os.Stat(config.LocalPromptFile)
+	if err != nil || info.IsDir() {
+		return ""
 	}
-	return fallback
+	if config.IsPromptTrusted(config.LocalPromptFile) {
+		return config.LocalPromptFile
+	}
+
+	// Only ask when we can actually talk to a human.
+	if st, err := os.Stdin.Stat(); err != nil || st.Mode()&os.ModeCharDevice == 0 {
+		logger.L.Warn("ignoring untrusted ./aig.md (no terminal to ask for consent)")
+		return ""
+	}
+
+	data, _ := os.ReadFile(config.LocalPromptFile)
+	preview := strings.TrimSpace(string(data))
+	if len(preview) > 400 {
+		preview = strings.ToValidUTF8(preview[:400], "") + "\n…"
+	}
+	fmt.Fprintf(os.Stderr, "Found ./%s (%d bytes). It would replace your system prompt:\n\n%s\n\nUse it and remember this version? [y/N] ",
+		config.LocalPromptFile, len(data), preview)
+
+	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	if answer != "y" && answer != "yes" {
+		fmt.Fprintln(os.Stderr, "→ ignoring ./aig.md for this run.")
+		return ""
+	}
+	if err := config.TrustPrompt(config.LocalPromptFile); err != nil {
+		logger.L.Warn("failed to record aig.md trust", "error", err)
+	}
+	return config.LocalPromptFile
 }

@@ -3,11 +3,14 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -59,89 +62,69 @@ type MCPServerConfig struct {
 	Command string            `json:"command"`        // executable to run, e.g. "npx" or "/usr/bin/python3"
 	Args    []string          `json:"args,omitempty"` // CLI arguments passed to the executable
 	Env     map[string]string `json:"env,omitempty"`  // extra environment variables (merged with os.Environ)
+	// Trusted servers' tools run without a per-call confirmation prompt.
+	Trusted bool `json:"trusted,omitempty"`
 }
 
 // FileConfig represents the JSON structure saved in ~/.config/aig/config.json.
 type FileConfig struct {
-	DefaultProvider string                     `json:"default_provider"`
-	DefaultModel    string                     `json:"default_model"`
-	DefaultPersona  string                     `json:"default_persona,omitempty"`
-	GeminiAPIKey    string                     `json:"gemini_api_key,omitempty"`
-	DeepSeekAPIKey  string                     `json:"deepseek_api_key,omitempty"`
-	Personas        map[string]string          `json:"personas,omitempty"`
+	DefaultProvider string            `json:"default_provider"`
+	DefaultModel    string            `json:"default_model"`
+	DefaultPersona  string            `json:"default_persona,omitempty"`
+	GeminiAPIKey    string            `json:"gemini_api_key,omitempty"`
+	DeepSeekAPIKey  string            `json:"deepseek_api_key,omitempty"`
+	Personas        map[string]string `json:"personas,omitempty"`
 	// MCPServers is an optional map of logical server names to their spawn configs.
 	// Leave empty (or omit) to run aig without any MCP servers.
-	MCPServers      map[string]MCPServerConfig `json:"mcp_servers,omitempty"`
+	MCPServers map[string]MCPServerConfig `json:"mcp_servers,omitempty"`
 }
 
 var defaultPersonas = map[string]string{
-	"default":  "You are aig, a highly capable terminal-based AI assistant. When suggesting shell commands, always wrap them in a fenced code block with the appropriate language tag (```bash, ```sh, or ```ps1). Be concise, precise, and helpful.",
-	"sysadmin": `You are a local CLI-based AI system assistant running on an Arch Linux machine.
+	"default": "You are aig, a highly capable terminal-based AI assistant. When suggesting shell commands, always wrap them in a fenced code block with the appropriate language tag (```bash, ```sh, or ```ps1). Be concise, precise, and helpful.",
+	"sysadmin": `You are a local CLI-based AI system assistant running on Bazzite OS — an image-based (Fedora Atomic / Universal Blue) Linux distribution — with the KDE Plasma 6 desktop on Wayland.
 
 Your role is to help the user manage, configure, debug, and optimize their system safely and effectively.
 
-You have access to:
-- Shell command execution
-- System logs (journalctl, dmesg, etc.)
-- File system operations
-- Package manager (pacman, yay)
-- Desktop environment configuration (Hyprland and related tools)
+----------------------------------------
+SYSTEM ARCHITECTURE (IMPORTANT)
+----------------------------------------
+- /usr is READ-ONLY. Never try to edit files under /usr or install with dnf/yum on the host.
+- Writable: /etc (config), /var (state, flatpaks, containers), and the home directory (/var/home/$USER, symlinked from /home).
+- Software, in order of preference:
+  1. Flatpak (GUI apps): flatpak install flathub <id>
+  2. Homebrew (CLI tools), if installed: brew install <pkg>
+  3. Distrobox/Toolbox containers for dev toolchains and anything dnf-based
+  4. rpm-ostree install <pkg> — layering, last resort; requires a reboot
+- System updates: ujust update (or rpm-ostree upgrade). Rollback: rpm-ostree rollback. Status: rpm-ostree status.
+- Bazzite helpers: ujust --choose lists curated maintenance recipes.
+- Desktop: KDE Plasma 6 (kwriteconfig6/kreadconfig6, systemsettings, plasmashell), PipeWire audio, systemd user + system services.
 
 ----------------------------------------
 CORE BEHAVIOR RULES
 ----------------------------------------
 
 1. THINK BEFORE EXECUTING
-- Always analyze the user's request first
-- Break tasks into clear steps before running commands
-- Identify risks, dependencies, and side effects
+- Analyze the request, break it into steps, identify risks and side effects.
 
 2. SAFE EXECUTION FIRST
-- NEVER run destructive commands without explicit confirmation
-- This includes: rm -rf, disk formatting, system-wide changes, service disabling
-- Prefer reversible actions whenever possible
+- NEVER run destructive commands without explicit confirmation (rm -rf, disk formatting, rpm-ostree reset/rebase, disabling services).
+- Prefer reversible actions; mention rpm-ostree rollback when relevant.
 
-3. EXPLAIN + ACT MODE
-- Before executing: briefly explain what you are about to do
-- Then provide commands in a clean, copyable format
-- If auto-executing is enabled, still log what you are doing
+3. PRIVILEGE ESCALATION
+- Use sudo only when required. In a graphical session aig routes sudo through the KDE password dialog automatically.
 
 4. VERIFY RESULTS
-- After each critical step:
-  - Check output
-  - Confirm success
-  - If failure → diagnose and retry or suggest fix
+- After each critical step check the output and confirm success; on failure diagnose before retrying.
 
-5. DEBUGGING MODE (IMPORTANT)
-When analyzing errors:
-- Always gather context first:
-  - system logs (journalctl -xe, dmesg)
-  - relevant config files
-  - recent changes
-- Then form hypotheses
-- Then test systematically
+5. DEBUGGING
+- Gather context first: journalctl -b -p warning, journalctl --user, systemctl --failed, dmesg, rpm-ostree status, relevant config files.
+- Then form hypotheses and test systematically.
 
-6. ARCH LINUX BEST PRACTICES
-- Prefer pacman for official packages
-- Use yay cautiously for AUR
-- Avoid unnecessary bloat
-- Follow Arch philosophy: simplicity, control, transparency
+6. IDEMPOTENCY
+- Commands should be safe to run multiple times when possible.
 
-7. WAYLAND AWARENESS
-- Suggest minimal, composable config changes
-- Avoid breaking the compositor
-
-8. IDEMPOTENCY
-- Commands should be safe to run multiple times when possible
-
-9. LOG EVERYTHING
-- Clearly show:
-  - commands executed
-  - outputs (summarized if large)
-  - errors
-
-10. ASK WHEN UNCERTAIN
-- If the request is ambiguous, ask clarifying questions before acting`,
+7. ASK WHEN UNCERTAIN
+- If the request is ambiguous, ask clarifying questions before acting.`,
 	"coder": `# IDENTITY & ROLE
 You are an elite, autonomous architectural analyst and code comprehension agent. Your primary objective is to investigate, map, and explain complex codebases with zero hallucinations and maximum token efficiency. You speak directly, precisely, and technically.
 
@@ -159,7 +142,7 @@ Execute code comprehension tasks using the following sequence:
 4. PARALLEL EXECUTION: When investigating multiple files, imports, or usages, you MUST invoke read/search tools concurrently to minimize latency.
 
 # REASONING & OUTPUT STANDARDS
-Before invoking tools or generating a final response, wrap your investigative logic in a ` + "`" + `<thought>` + "`" + ` block. Your internal monologue should map out what you know, what you need to find, and which tools will get you there.
+Before invoking tools or generating a final response, wrap your investigative logic in a ` + "`" + `<think>` + "`" + ` block. Your internal monologue should map out what you know, what you need to find, and which tools will get you there.
 
 When delivering your final analysis to the user, apply the following structured reasoning:
 * Diagnose: Briefly state the exact scope and purpose of the code.
@@ -192,7 +175,7 @@ func DefaultModel(p ProviderName) string {
 	case ProviderDeepSeek:
 		return "deepseek-v4-flash"
 	default:
-		return "gemini-2.0-flash"
+		return "gemini-2.5-flash"
 	}
 }
 
@@ -242,21 +225,52 @@ func ResolvePersona(name string, fc *FileConfig) (string, bool) {
 	return "", false
 }
 
-// LoadFileConfig reads and parses the config file, returning a zero-value
-// FileConfig (not an error) if the file is absent or unreadable.
-func LoadFileConfig() *FileConfig {
+// LoadFileConfigE reads and parses the config file. A missing file is not an
+// error (a zero config is returned); malformed JSON is.
+//
+// Personas: built-in defaults are always available; personas in the file
+// override or extend them.
+func LoadFileConfigE() (*FileConfig, error) {
+	fc := &FileConfig{}
 	data, err := os.ReadFile(Path())
+	switch {
+	case os.IsNotExist(err):
+		// fine — use defaults
+	case err != nil:
+		return nil, fmt.Errorf("config: cannot read %s: %w", Path(), err)
+	default:
+		if err := json.Unmarshal(data, fc); err != nil {
+			return nil, fmt.Errorf("config: invalid JSON in %s: %w", Path(), err)
+		}
+	}
+
+	merged := make(map[string]string, len(defaultPersonas)+len(fc.Personas))
+	for k, v := range defaultPersonas {
+		merged[k] = v
+	}
+	for k, v := range fc.Personas {
+		merged[strings.ToLower(k)] = v
+	}
+	fc.Personas = merged
+	return fc, nil
+}
+
+// LoadFileConfig is LoadFileConfigE that falls back to built-in defaults on
+// error (used for best-effort lookups inside the TUI).
+func LoadFileConfig() *FileConfig {
+	fc, err := LoadFileConfigE()
 	if err != nil {
-		return &FileConfig{Personas: defaultPersonas}
+		return &FileConfig{Personas: copyPersonas(defaultPersonas)}
 	}
-	var fc FileConfig
-	if err := json.Unmarshal(data, &fc); err != nil {
-		return &FileConfig{Personas: defaultPersonas}
+	return fc
+}
+
+func copyPersonas(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
 	}
-	if fc.Personas == nil {
-		fc.Personas = defaultPersonas
-	}
-	return &fc
+	return out
 }
 
 // WriteDefaultConfig writes a boilerplate configuration file if none exists.
@@ -271,7 +285,8 @@ func WriteDefaultConfig(path string) error {
 		DefaultPersona:  "coder",
 		GeminiAPIKey:    "",
 		DeepSeekAPIKey:  "",
-		Personas:        defaultPersonas,
+		// Personas is left empty: built-ins are merged in at load time, so
+		// improvements to them take effect. Add your own personas here.
 		// MCPServers is nil by default so the key is omitted from the written JSON.
 		// Users add entries manually to enable MCP tool servers; see MCPServerConfig GoDoc.
 	}
@@ -296,10 +311,9 @@ func Load(providerOverride ProviderName, modelOverride string, personaName strin
 	cfgPath := Path()
 	_ = WriteDefaultConfig(cfgPath) // Ensure the file exists
 
-	data, err := os.ReadFile(cfgPath)
-	var fc FileConfig
-	if err == nil {
-		_ = json.Unmarshal(data, &fc)
+	fc, err := LoadFileConfigE()
+	if err != nil {
+		return nil, err
 	}
 
 	// 1. Resolve Provider (CLI override > File config > Default)
@@ -322,76 +336,33 @@ func Load(providerOverride ProviderName, modelOverride string, personaName strin
 	}
 
 	// 3. Resolve API Key (Environment variable > File config)
-	var (
-		apiKey  string
-		envName string
-	)
-
+	var envName string
 	switch provider {
 	case ProviderGemini:
 		envName = "GEMINI_API_KEY"
-		apiKey = os.Getenv(envName)
-		if apiKey == "" {
-			apiKey = fc.GeminiAPIKey
-		}
 	case ProviderDeepSeek:
 		envName = "DEEPSEEK_API_KEY"
-		apiKey = os.Getenv(envName)
-		if apiKey == "" {
-			apiKey = fc.DeepSeekAPIKey
-		}
 	default:
 		return nil, fmt.Errorf("unknown provider: %q (valid: gemini, deepseek)", provider)
 	}
-
+	apiKey := apiKeyFrom(provider, fc)
 	if apiKey == "" {
 		return nil, fmt.Errorf("missing API key for %s. Either set environment variable %s or configure it in %s", provider, envName, cfgPath)
 	}
 
-	// 4. Resolve System Prompt (Persona)
+	// 4. Resolve System Prompt (Persona). A local ./aig.md is NOT picked up
+	// here implicitly — the caller decides (with user consent) and passes it
+	// as personaName. See IsPromptTrusted / TrustPrompt.
 	if personaName == "" {
-		if info, err := os.Stat("aig.md"); err == nil && !info.IsDir() {
-			personaName = "aig.md"
-		} else {
-			personaName = fc.DefaultPersona
-		}
+		personaName = fc.DefaultPersona
 	}
 	if personaName == "" {
 		personaName = "coder"
 	}
 
-	var systemPrompt string
-	var ok bool
-
-	// Check if personaName is a file path first, before lowercasing, to preserve path casing
-	if info, err := os.Stat(personaName); err == nil && !info.IsDir() {
-		if data, err := os.ReadFile(personaName); err == nil {
-			systemPrompt = string(data)
-			ok = true
-		}
-	}
-
+	systemPrompt, ok := ResolvePersona(personaName, fc)
 	if !ok {
-		lowerPersona := strings.ToLower(personaName)
-		if fc.Personas != nil {
-			if prompt, ok2 := fc.Personas[lowerPersona]; ok2 {
-				systemPrompt = prompt
-				ok = true
-			} else if prompt, ok2 := defaultPersonas[lowerPersona]; ok2 {
-				systemPrompt = prompt
-				ok = true
-			}
-		} else if prompt, ok2 := defaultPersonas[lowerPersona]; ok2 {
-			systemPrompt = prompt
-			ok = true
-		}
-	}
-
-	if !ok {
-		if fc.Personas != nil {
-			return nil, fmt.Errorf("unknown persona %q. Available personas in config: %v", personaName, getKeys(fc.Personas))
-		}
-		return nil, fmt.Errorf("unknown persona %q (valid default options: default, sysadmin, coder)", personaName)
+		return nil, fmt.Errorf("unknown persona %q. Available personas: %v", personaName, getKeys(fc.Personas))
 	}
 
 	return &Config{
@@ -408,12 +379,16 @@ func getKeys(m map[string]string) []string {
 	for k := range m {
 		keys = append(keys, k)
 	}
+	sort.Strings(keys)
 	return keys
 }
 
 // GetAPIKey resolves the API key dynamically from environment or file config.
 func GetAPIKey(provider ProviderName) string {
-	fc := LoadFileConfig()
+	return apiKeyFrom(provider, LoadFileConfig())
+}
+
+func apiKeyFrom(provider ProviderName, fc *FileConfig) string {
 	switch provider {
 	case ProviderGemini:
 		if v := os.Getenv("GEMINI_API_KEY"); v != "" {
@@ -427,4 +402,68 @@ func GetAPIKey(provider ProviderName) string {
 		return fc.DeepSeekAPIKey
 	}
 	return ""
+}
+
+// ── Local prompt trust store ──────────────────────────────────────────────────
+//
+// A ./aig.md in the working directory can replace the system prompt. Because
+// any cloned repository could ship one, aig only uses it after the user has
+// approved that exact file content once. Approvals are stored as
+// absolute-path → sha256 in trusted_prompts.json next to config.json; editing
+// the file invalidates the approval.
+
+// LocalPromptFile is the per-directory system prompt filename.
+const LocalPromptFile = "aig.md"
+
+func trustStorePath() string {
+	return filepath.Join(filepath.Dir(Path()), "trusted_prompts.json")
+}
+
+func fileDigest(path string) (absPath, digest string, err error) {
+	absPath, err = filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return "", "", err
+	}
+	sum := sha256.Sum256(data)
+	return absPath, hex.EncodeToString(sum[:]), nil
+}
+
+func loadTrustStore() map[string]string {
+	store := map[string]string{}
+	if data, err := os.ReadFile(trustStorePath()); err == nil {
+		_ = json.Unmarshal(data, &store)
+	}
+	return store
+}
+
+// IsPromptTrusted reports whether the file at path was previously approved
+// with its current content.
+func IsPromptTrusted(path string) bool {
+	abs, digest, err := fileDigest(path)
+	if err != nil {
+		return false
+	}
+	return loadTrustStore()[abs] == digest
+}
+
+// TrustPrompt records approval of the file's current content.
+func TrustPrompt(path string) error {
+	abs, digest, err := fileDigest(path)
+	if err != nil {
+		return err
+	}
+	store := loadTrustStore()
+	store[abs] = digest
+	data, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(trustStorePath()), 0o750); err != nil {
+		return err
+	}
+	return os.WriteFile(trustStorePath(), data, 0o600)
 }

@@ -95,8 +95,36 @@ func Save(s *Session) error {
 		return fmt.Errorf("session: failed to marshal: %w", err)
 	}
 
-	if err := os.WriteFile(filename, data, 0o600); err != nil {
+	// Write to a temp file in the same directory, then rename over the target,
+	// so a crash mid-write never leaves a truncated/corrupt session.
+	tmp, err := os.CreateTemp(dir, s.ID+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("session: failed to create temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
 		return fmt.Errorf("session: failed to write file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("session: failed to sync file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("session: failed to close file: %w", err)
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		cleanup()
+		return fmt.Errorf("session: failed to chmod file: %w", err)
+	}
+	if err := os.Rename(tmpName, filename); err != nil {
+		cleanup()
+		return fmt.Errorf("session: failed to replace file: %w", err)
 	}
 
 	return nil

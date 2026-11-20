@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -48,31 +49,114 @@ func TestResolvePersonaWithFile(t *testing.T) {
 	}
 }
 
-func TestLoadWithLocalAigMd(t *testing.T) {
-	// Backup environment variables
-	origKey := os.Getenv("GEMINI_API_KEY")
-	defer os.Setenv("GEMINI_API_KEY", origKey)
-	os.Setenv("GEMINI_API_KEY", "mock-gemini-key")
+// isolateHome points HOME (and thus Path()) at a temp dir so tests never
+// touch the real ~/.config/aig.
+func isolateHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("GEMINI_API_KEY", "mock-gemini-key")
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	return home
+}
 
-	// Create a local aig.md in the current directory (which is internal/config during go test)
-	localPrompt := "Local aig.md prompt content"
-	err := os.WriteFile("aig.md", []byte(localPrompt), 0o600)
-	if err != nil {
-		t.Fatalf("failed to write local aig.md: %v", err)
+func TestLoadIgnoresLocalAigMdUnlessPassed(t *testing.T) {
+	isolateHome(t)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile(LocalPromptFile, []byte("Local prompt"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	defer os.Remove("aig.md")
 
-	// Load config with empty persona
+	// Empty persona → aig.md must NOT be picked up implicitly.
 	cfg, err := Load("", "", "")
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
-
-	if cfg.Persona != "aig.md" {
-		t.Errorf("expected Persona to be 'aig.md', got %q", cfg.Persona)
+	if cfg.Persona != "coder" {
+		t.Errorf("expected default persona 'coder', got %q", cfg.Persona)
 	}
 
-	if cfg.SystemPrompt != localPrompt {
-		t.Errorf("expected SystemPrompt to be %q, got %q", localPrompt, cfg.SystemPrompt)
+	// Explicitly passed (after user consent) → used.
+	cfg, err = Load("", "", LocalPromptFile)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.SystemPrompt != "Local prompt" {
+		t.Errorf("expected local prompt, got %q", cfg.SystemPrompt)
+	}
+}
+
+func TestPromptTrustStore(t *testing.T) {
+	isolateHome(t)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile(LocalPromptFile, []byte("v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if IsPromptTrusted(LocalPromptFile) {
+		t.Fatal("new file must not be trusted")
+	}
+	if err := TrustPrompt(LocalPromptFile); err != nil {
+		t.Fatal(err)
+	}
+	if !IsPromptTrusted(LocalPromptFile) {
+		t.Fatal("approved file should be trusted")
+	}
+
+	// Changing the content invalidates the approval.
+	if err := os.WriteFile(LocalPromptFile, []byte("v2 — injected"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if IsPromptTrusted(LocalPromptFile) {
+		t.Fatal("modified file must not stay trusted")
+	}
+}
+
+func TestDefaultConfigDoesNotCopyPersonas(t *testing.T) {
+	home := isolateHome(t)
+	if err := WriteDefaultConfig(Path()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(Path(), home) {
+		t.Fatalf("Path() escaped the test HOME: %s", Path())
+	}
+	data, err := os.ReadFile(Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "personas") {
+		t.Errorf("default config should not embed built-in personas:\n%s", data)
+	}
+
+	// Built-ins are still available, and user personas override them.
+	custom := `{"personas": {"coder": "my coder", "mine": "custom"}}`
+	if err := os.WriteFile(Path(), []byte(custom), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fc, err := LoadFileConfigE()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fc.Personas["coder"] != "my coder" || fc.Personas["mine"] != "custom" {
+		t.Errorf("user personas not applied: %v", fc.Personas["coder"])
+	}
+	if fc.Personas["sysadmin"] == "" {
+		t.Error("built-in sysadmin persona missing after merge")
+	}
+}
+
+func TestLoadReportsInvalidJSON(t *testing.T) {
+	isolateHome(t)
+	if err := os.MkdirAll(filepath.Dir(Path()), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(Path(), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load("", "", ""); err == nil {
+		t.Fatal("expected an error for malformed config JSON")
 	}
 }
