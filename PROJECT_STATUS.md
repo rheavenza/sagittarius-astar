@@ -9,12 +9,13 @@ This file serves as a compressed "brain dump" for future AI agents working on th
 ---
 
 ## 🏗️ Architecture & Core Modules
-- **`internal/tui/`**: The heart of the application. Uses Bubble Tea's Elm architecture.
-  - `model.go`: Contains the main state machine (`Model`), initialization, and command streaming logic.
-  - *Key States*: `stateInput` (normal chat), `stateStreaming` (LLM is typing), `stateExecutingTool` / `stateExecuting` (sandbox commands), `stateRuntimeInput` (injecting stdin mid-execution).
-- **`internal/sandbox/`**: Executes OS commands. Uses `io.Pipe` to feed stdin dynamically.
-- **`internal/llm/`**: Abstractions for AI providers (Gemini, DeepSeek).
-- **`internal/config/`**: Configuration management. Loads from `~/.config/aig/config.json` or Environment Variables (ENV vars *always* take precedence).
+- **`internal/agent/`**: the agent loop, independent of any UI. `Agent.Run(ctx, history)` returns an event channel (`StreamStartEvent`, `TokenEvent`, `MessageEvent`, `ToolStartEvent`, `ToolResultEvent`, `ApprovalEvent`, `NoticeEvent`, final `DoneEvent`). Approval policy lives in `execute.go`; loop breakers and "every tool_call gets a result" in `agent.go`.
+- **`internal/tools/`**: native tool definitions and implementations (read/search/find/edit/multi_edit/write/run/web), edit matching (`edits.go`), post-edit checks (`checks.go`), risk levels (`risk.go`).
+- **`internal/tui/`**: Bubble Tea front-end. `turn.go` maps agent events to display and answers `ApprovalRequest`s; `model.go` holds state, slash commands, layout; `providers.go` provider/model switching.
+- **`internal/prompt/`**: environment block + instruction files (AGENTS.md…) appended to the system prompt.
+- **`internal/llm/`**: providers (Gemini, OpenAI-compatible DeepSeek/NIM), history pruning, `ThinkSplitter` for inline `<think>` reasoning.
+- **`internal/sandbox/`**: command execution (process groups, output caps, askpass sudo, stdin wiring).
+- **`internal/mcp/`**, **`internal/config/`**, **`internal/session/`**: MCP host, configuration, persistence.
 
 ---
 
@@ -46,10 +47,13 @@ This file serves as a compressed "brain dump" for future AI agents working on th
 
 ## ⚠️ Crucial Rules & Quirks for Future AIs
 
-- **Reasoning Prefix (`\x00`)**: Do not remove the null byte prefix from streamed reasoning tokens. The TUI relies on this prefix to route tokens to `reasoningBuffer` instead of `streamBuffer`.
+- **Reasoning Prefix (`\x00`)**: Providers prefix native reasoning tokens with a null byte; `agent.stream` turns them into `TokenEvent{Reasoning: true}`. Keep the prefix in providers.
 - **MCP Server Graces**: When adding or managing MCP servers, ensure `Registry.Shutdown()` is called *before* `Manager.Shutdown()` to drain pending requests safely before closing the pipes.
+- **History ownership**: during a turn the agent owns the conversation; the TUI appends each `MessageEvent.Msg` to `m.history` in order and must not modify history while `m.events != nil`.
+- **Bubble Tea copies the Model by value**: keep `strings.Builder` / splitters behind pointers (`*streamState`).
+- **stdin for commands**: never hand `os/exec` a non-`*os.File` reader that stays open — use `sandbox.ExecuteWithStdin`, which wires an OS pipe (`attachStdin`).
 - **Bubble Tea State Changes**: Whenever the `appState` changes to something that alters the UI height (like opening the Runtime Input box), you MUST ensure `m.recalculateDimensions()` is called so the viewport resizes correctly.
-- **Loop Breaker State Resets**: Ensure `consecutiveSameCalls` and `consecutiveErrors` are correctly reset upon tool execution successes or state changes to prevent false positives.
+- **Loop breakers** are per turn (state on `agent.turn`), so they reset automatically for each user message.
 - **Every tool_call needs a result**: Any path that stops a tool batch early (loop breaker, user abort, denial, cancelled write/sudo) MUST append a tool message for each unanswered call (`answerRemainingToolCalls` / `skippedToolResults` in `internal/tui/toolflow.go`). OpenAI-compatible APIs return HTTP 400 otherwise.
 - **Gemini system messages**: Only the first `RoleSystem` message becomes Gemini's system instruction; later ones are sent as `[system note]` user text (`buildGeminiContents`). Don't reintroduce "last one wins".
 - **MCP names**: MCP tools are exposed as `mcp__<server>__<tool>` (`mcp.ExposedName`); the registry maps back to the original name for `tools/call`.

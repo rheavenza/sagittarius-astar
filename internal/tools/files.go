@@ -1,4 +1,4 @@
-package tui
+package tools
 
 import (
 	"bufio"
@@ -347,7 +347,7 @@ func goSearch(re *regexp.Regexp, dir, fileGlob string) ([]string, bool, error) {
 			}
 			line = strings.TrimSpace(line)
 			if len(line) > 300 {
-				line = truncateUTF8(line, 300) + "…"
+				line = TruncateUTF8(line, 300) + "…"
 			}
 			matches = append(matches, fmt.Sprintf("%s:%d: %s", joinDisplay(dir, rel), i+1, line))
 			if len(matches) >= maxSearchMatches {

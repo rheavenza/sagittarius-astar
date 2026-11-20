@@ -1,47 +1,5 @@
 // Package tui — custom Bubble Tea message types for the aig TUI.
 package tui
 
-import "github.com/clitorhea/sagittarius-astar.git/internal/llm"
-
-// tokenMsg carries a single streamed token chunk from the LLM.
-type tokenMsg string
-
-// streamDoneMsg signals that the LLM stream has completed successfully.
-// ReasoningContent is non-empty for DeepSeek thinking models on non-tool turns.
-type streamDoneMsg struct {
-	ReasoningContent string
-}
-
-// streamErrMsg signals that the LLM stream encountered an error.
-type streamErrMsg struct{ err error }
-
-func (e streamErrMsg) Error() string { return e.err.Error() }
-
-// execResultMsg carries the combined stdout/stderr from a sandbox execution.
-type execResultMsg struct {
-	output string
-	err    error
-}
-
-// execConfirmMsg signals that a code block was found and the TUI should
-// ask the user for confirmation before executing.
-type execConfirmMsg struct {
-	Command string
-	Lang    string
-}
-
-// toolCallMsg signals that the LLM requested a single tool call.
-// Kept for backward compatibility; new code uses toolCallBatchMsg.
-type toolCallMsg struct {
-	Call llm.ToolCall
-}
-
-// toolCallBatchMsg signals that the LLM requested one or more tool calls
-// in a single turn. This is the primary dispatch path.
-type toolCallBatchMsg struct {
-	Calls            []llm.ToolCall
-	ReasoningContent string // populated by DeepSeek thinking models
-}
-
-// windowSizeMsg is re-exported here for clarity (bubbletea sends tea.WindowSizeMsg natively).
-// We alias it here so internal code is self-contained.
+// sessionTitleMsg carries a generated session title.
+type sessionTitleMsg string

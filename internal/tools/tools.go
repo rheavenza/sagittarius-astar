@@ -1,4 +1,4 @@
-package tui
+package tools
 
 import (
 	"context"
@@ -19,7 +19,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/workspace"
 )
 
-// ErrWriteConfirmationRequired is returned by ExecuteToolWithWrite when a tool
+// ErrWriteConfirmationRequired is returned by Execute when a tool
 // produces a file mutation that needs the user's explicit approval.
 var ErrWriteConfirmationRequired = fmt.Errorf("write_file: user confirmation required")
 
@@ -70,8 +70,8 @@ func CommitWrite(pw PendingWrite) error {
 	return nil
 }
 
-// AgentTools returns the list of tools available to the LLM agent.
-func AgentTools() []llm.Tool {
+// Definitions returns the native tools offered to the LLM.
+func Definitions() []llm.Tool {
 	return []llm.Tool{
 		// ── read_file ────────────────────────────────────────────────────────
 		{
@@ -310,20 +310,13 @@ Prefer specific, targeted commands. Avoid commands that start interactive sessio
 
 // ── Tool execution ────────────────────────────────────────────────────────────
 
-// ExecuteTool is a convenience wrapper around ExecuteToolWithWrite for tools
-// that never produce a PendingWrite.
-func ExecuteTool(call llm.ToolCall) (string, error) {
-	result, _, err := ExecuteToolWithWrite(call)
-	return result, err
-}
-
-// ExecuteToolWithWrite executes a tool call and returns its string result.
+// Execute executes a tool call and returns its string result.
 // For file-mutation tools (write_file, edit_file) it returns a PendingWrite
 // that the TUI must confirm before calling CommitWrite.
 // For run_command it returns ErrWriteConfirmationRequired so the TUI can gate
 // execution through its approval flow; the sandbox.Options are embedded in the
 // returned PendingWrite with Path="" to signal "command, not a file".
-func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, err error) {
+func Execute(call llm.ToolCall) (result string, pw *PendingWrite, err error) {
 	switch call.Name {
 
 	// ── read_file ────────────────────────────────────────────────────────────
@@ -629,7 +622,7 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 
 		const maxBytes = 30 * 1024 // 30 KB
 		if len(text) > maxBytes {
-			text = truncateUTF8(text, maxBytes) + "\n... (truncated at 30 KB)"
+			text = TruncateUTF8(text, maxBytes) + "\n... (truncated at 30 KB)"
 		}
 		return strings.TrimSpace(text), nil, nil
 
@@ -638,11 +631,11 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 	}
 }
 
-// ExecuteRunCommand executes a run_command call directly via the sandbox.
+// RunCommand executes a run_command call directly via the sandbox.
 // This is called by the TUI after user approval (or auto-approve).
 // stdin may be nil (falls back to the default sudo-seed buffer via sandbox.Execute),
 // or an io.Reader (e.g. an io.Pipe read-end for interactive mid-run input injection).
-func ExecuteRunCommand(ctx context.Context, call llm.ToolCall, sudoPassword string, stdin io.Reader) (string, error) {
+func RunCommand(ctx context.Context, call llm.ToolCall, sudoPassword string, stdin io.Reader) (string, error) {
 	command, _ := call.Args["command"].(string)
 	workingDir, _ := call.Args["working_dir"].(string)
 
@@ -734,7 +727,7 @@ func numberedLines(path, content string, start, end int) string {
 	for i := start; i <= end; i++ {
 		line := lines[i-1]
 		if len(line) > 2000 {
-			line = truncateUTF8(line, 2000) + "…(line truncated)"
+			line = TruncateUTF8(line, 2000) + "…(line truncated)"
 		}
 		entry := fmt.Sprintf("%6d\t%s\n", i, line)
 		if b.Len()+len(entry) > maxReadBytes {
@@ -750,8 +743,8 @@ func numberedLines(path, content string, start, end int) string {
 	return out
 }
 
-// truncateUTF8 cuts s to at most max bytes without splitting a multi-byte rune.
-func truncateUTF8(s string, max int) string {
+// TruncateUTF8 cuts s to at most max bytes without splitting a multi-byte rune.
+func TruncateUTF8(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
@@ -787,14 +780,14 @@ var toolPathArgs = map[string][2]string{
 	"map_workspace":  {"dir", "."},
 }
 
-// NativeToolNeedsApproval decides whether a native (non run_command,
+// NeedsApproval decides whether a native (non run_command,
 // non-write) tool call must be confirmed by the user before it runs.
 //
 // Reading inside the workspace root runs freely. Reading outside it, and
 // fetching arbitrary URLs, need approval: together, unrestricted reads and
 // unrestricted outbound requests let injected instructions (from a web page or
 // a file) exfiltrate secrets such as ~/.ssh keys.
-func NativeToolNeedsApproval(call llm.ToolCall, workspaceRoot string) (bool, string) {
+func NeedsApproval(call llm.ToolCall, workspaceRoot string) (bool, string) {
 	if call.Name == "web_fetch" || call.Name == "web_scrape" {
 		u, _ := call.Args["url"].(string)
 		return true, "fetch URL: " + u
@@ -892,19 +885,4 @@ func simpleDiff(oldContent, newContent string) string {
 	}
 
 	return strings.TrimRight(sb.String(), "\n")
-}
-
-// toolCallResultMsg is an internal TUI message to deliver a tool execution result.
-type toolCallResultMsg struct {
-	CallID string
-	Name   string
-	Result string
-	Error  error
-}
-
-// writeConfirmMsg is sent when write_file requires user confirmation before committing.
-type writeConfirmMsg struct {
-	CallID  string
-	Name    string
-	Pending PendingWrite
 }

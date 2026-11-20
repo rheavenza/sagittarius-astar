@@ -43,15 +43,22 @@ Most edit failures come from the tools, not from the model.
 - ⬜ Project `checks` in config (`"test": "go test ./..."`) surfaced to the model as the
   definition of done.
 
-## Phase 3 — Agent core refactor ⬜
+## Phase 3 — Agent core refactor ✅  *(branch `refactor/agent-core`)*
 Prerequisite for headless mode, subagents and proper tests.
 
-- ⬜ Extract `internal/agent`: the loop, tool routing, loop breakers, approvals as callbacks, and
-  an event stream (`Token`, `Reasoning`, `ToolStart`, `ToolResult`, `ApprovalNeeded`, `Done`).
-- ⬜ `Tool` interface + risk levels (read / write / exec / network) shared by native and MCP tools.
-- ⬜ Remove the legacy "regex on markdown code blocks" execution path.
-- ⬜ Fake-provider test harness for end-to-end agent tests.
-- ⬜ Fix O(n²) streaming re-render.
+- ✅ `internal/agent` runs the loop: tool routing, loop breakers, approvals, cancellation and an
+  event stream (`StreamStart`, `Token`, `Message`, `ToolStart`, `ToolResult`, `Approval`,
+  `Notice`, `Done`). The TUI only renders events and answers approval requests
+  (`model.go`: 2,900 → ~1,500 lines).
+- ✅ `internal/tools` holds the native tools. Each has a `Risk` level (read / network / write /
+  exec / external), and the approval policy for native and MCP tools is based on it.
+- ✅ Removed the legacy "regex on markdown code blocks" execution path.
+- ✅ Fake-provider test harnesses: agent end-to-end tests, plus TUI tests that drive `Update`
+  with key presses.
+- ✅ Streaming re-render is no longer O(n²): an incremental `<think>` splitter, a cached
+  transcript prefix, and renders throttled to about 30 fps.
+- ✅ Fixed: `run_command` could hang after the command finished, because exec waited on the
+  open stdin pipe.
 
 ## Phase 4 — Safety net ⬜
 - ⬜ Git checkpoints before the first agent edit of each turn (hidden refs, no impact on your index).

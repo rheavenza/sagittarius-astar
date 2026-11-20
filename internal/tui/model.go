@@ -1,23 +1,15 @@
-// Package tui — Bubble Tea model implementing the aig state machine.
+// Package tui is aig's Bubble Tea front-end. The agent loop itself lives in
+// internal/agent; this package renders its events and collects approvals.
 //
-// State transitions:
-//
-//	INPUT ──submit──► STREAMING ──done──► INPUT
-//	                      │
-//	                  code block found
-//	                      │
-//	                      ▼
-//	                 CONFIRMING_CMD ──y──► EXECUTING_CMD ──► INPUT
-//	                      │                                   ▲
-//	                    n/Esc                                  │
-//	                      └──────────────────────────────────┘
+//	INPUT ──submit──► STREAMING ⇄ EXECUTING_TOOL ──done──► INPUT
+//	                       │              ▲
+//	              approval needed      answered
+//	                       ▼              │
+//	        CONFIRMING_CMD / _WRITE / _TOOL / SUDO_PASSWORD
 package tui
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -34,12 +26,13 @@ import (
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/clitorhea/sagittarius-astar.git/internal/agent"
 	"github.com/clitorhea/sagittarius-astar.git/internal/config"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
-	"github.com/clitorhea/sagittarius-astar.git/internal/mcp"
 	"github.com/clitorhea/sagittarius-astar.git/internal/sandbox"
 	"github.com/clitorhea/sagittarius-astar.git/internal/session"
+	"github.com/clitorhea/sagittarius-astar.git/internal/tools"
 	"github.com/clitorhea/sagittarius-astar.git/internal/workspace"
 )
 
@@ -48,53 +41,42 @@ type state int
 
 const (
 	stateInput             state = iota // Waiting for user to type and submit.
-	stateStreaming                      // LLM is streaming tokens.
-	stateConfirmingCmd                  // Awaiting y/n for command execution.
-	stateExecuting                      // Sandbox command is running.
-	stateExecutingTool                  // Agent tool is executing autonomously.
-	stateExecutingTools                 // Multiple agent tools executing concurrently.
-	stateConfirmingWrite                // Awaiting y/n for write_file tool.
-	stateSelecting                      // Selecting options (models, history, providers, personas)
-	stateInputSudoPassword              // Awaiting user input for sudo password.
-	stateRuntimeInput                   // Sending a stdin line to an already-running process.
-	stateConfirmingTool                 // Awaiting y/n for an MCP / web_fetch / out-of-workspace tool call.
+	stateStreaming                      // Model is streaming a response.
+	stateConfirmingCmd                  // Awaiting approval (and optional edit) of run_command.
+	stateExecutingTool                  // A tool is running, or waiting for the agent.
+	stateConfirmingWrite                // Awaiting approval of a file change.
+	stateSelecting                      // Selecting options (models, history, providers, personas).
+	stateInputSudoPassword              // Awaiting a sudo password (no graphical askpass).
+	stateRuntimeInput                   // Sending a stdin line to a running command.
+	stateConfirmingTool                 // Awaiting approval of an MCP / web_fetch / out-of-workspace tool call.
 )
-
-// execLangs are the code fence tags that trigger the sandbox prompt.
-var execLangPattern = regexp.MustCompile("(?m)^```(bash|sh|ps1|powershell)\n((?s).*?)\n```")
 
 type selectionItem struct {
 	ID    string
 	Label string
 }
 
-type sessionTitleMsg string
-
-// ToolTelemetry tracks telemetry of an individual tool call execution.
-type ToolTelemetry struct {
-	Name     string        `json:"name"`
-	ArgsHash string        `json:"args_hash"`
-	Duration time.Duration `json:"duration"`
-	Success  bool          `json:"success"`
-}
-
 // Model is the Bubble Tea application model for aig.
 type Model struct {
-	// Telemetry and loop breaker governance
-	consecutiveSameCalls int
-	consecutiveErrors    int
-	lastToolName         string
-	lastArgsHash         string
-	loopErrorCount       int
-	toolTelemetry        []ToolTelemetry
-	// Real-time reasoning buffers
-	rawStreamBuffer    string
-	nativeReasoningBuf string
-	isDeliberating     bool
 	// Core state
 	appState state
-	history  []llm.Message // full conversation history
-	provider llm.Provider
+	history  []llm.Message // full conversation history (mirrors the agent's)
+	agent    *agent.Agent
+
+	// Running turn
+	turnID      int
+	events      <-chan agent.Event
+	cancelTurn  context.CancelFunc
+	cancelling  bool
+	approval    *agent.ApprovalRequest // pending approval, if any
+	currentTool *agent.ToolStartEvent  // tool currently executing
+	stdin       io.Writer              // stdin of the running command (Ctrl+I)
+
+	// Streaming display
+	stream         *streamState
+	isDeliberating bool
+	lastRender     time.Time
+	renderPending  bool
 
 	// Session management
 	activeSession       *session.Session
@@ -111,74 +93,23 @@ type Model struct {
 	activeModel    string
 	activePersona  string
 
-	// Core dependencies
-	fileConfig *config.FileConfig // parsed config, for persona resolution
-	// mcpRegistry holds the live MCP tool registry. Nil when no MCP servers are
-	// configured — all existing code paths remain unaffected in that case.
-	mcpRegistry *mcp.Registry
+	// fileConfig is the parsed config, for persona resolution.
+	fileConfig *config.FileConfig
 
-	// autoApproveCommands skips the confirmation dialog for run_command tool calls.
-	autoApproveCommands bool
-
-	// pendingToolCalls holds the full batch returned by the LLM for sequential processing.
-	pendingToolCalls []llm.ToolCall
-	pendingToolIdx   int // index of the next call to process in pendingToolCalls
-
-	// Streaming state
-	tokenChan       chan string
-	streamBuffer    string // accumulates tokens during streaming
-	reasoningBuffer string // accumulates DeepSeek reasoning_content tokens (not displayed)
-	cancelStream    context.CancelFunc
-
-	// Pending command execution
-	pendingCmd  string
-	pendingLang string
-
-	// cancelExec cancels a running sandbox child process without quitting the app.
-	cancelExec context.CancelFunc
-
-	// stdinPipe is the write end of the pipe connected to the running process's stdin.
-	// Non-nil only while stateExecuting or stateExecutingTool with a pipe-based command.
-	stdinPipe io.WriteCloser
-
-	// runtimeInput is the single-line input box shown in stateRuntimeInput.
-	runtimeInput textinput.Model
-
-	// Pending write_file confirmation
-	pendingWrite       *PendingWrite
-	pendingWriteCallID string
-	pendingWriteName   string
-
-	// pendingConfirmCall is the tool call awaiting approval in stateConfirmingTool.
-	pendingConfirmCall *llm.ToolCall
-
-	// toolAbortRequested is set by Ctrl+C while a tool runs. The in-flight
-	// tool's own result still arrives (exactly once); the remaining calls in
-	// the batch are then marked aborted and control returns to the user.
-	toolAbortRequested bool
-
-	// contextBlock (environment + project instructions) is appended to the
-	// system prompt of every outgoing request, never stored in history.
-	contextBlock string
-
-	// workspaceRoot is the directory aig was started in; read-only tools may
-	// access it freely, anything outside requires approval.
-	workspaceRoot string
-
-	// providerFingerprint is provider|model|apiKey of the live m.provider, so
-	// the client is only rebuilt when one of those actually changes.
+	// providerFingerprint is provider|model|baseURL|apiKey of the live
+	// provider, so the client is only rebuilt when one of those changes.
 	providerFingerprint string
 
 	// UI components
 	textarea           textarea.Model
 	cmdTextarea        textarea.Model
 	sudoTextInput      textinput.Model
+	runtimeInput       textinput.Model
 	viewport           viewport.Model
 	spinner            spinner.Model
 	progressBar        progress.Model
 	execStart          time.Time
 	execTimeout        time.Duration
-	sudoPassword       string
 	autocompletePrefix string
 	autocompleteIdx    int
 
@@ -188,7 +119,7 @@ type Model struct {
 	lastRendererWidth int
 
 	// Rendered display content
-	outputLines []string // rendered lines in the viewport
+	outputLines []string
 
 	// Glamour renderer
 	renderer *glamour.TermRenderer
@@ -205,7 +136,8 @@ type Model struct {
 
 // NewModel constructs a new TUI model wired to the given LLM provider and session.
 // registry may be nil when no MCP servers are configured; all features work identically.
-func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string, appVersion string, providerName string, modelName string, personaName string, registry *mcp.Registry) (*Model, error) {
+// NewModel constructs the TUI around an agent and the active session.
+func NewModel(ag *agent.Agent, activeSession *session.Session, defaultSystemPrompt string, appVersion string, providerName string, modelName string, personaName string) (*Model, error) {
 	// Text area
 	ta := textarea.New()
 	ta.Placeholder = "Ask anything… (Enter to send, Shift+Enter for newline, /help for commands)"
@@ -253,14 +185,12 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 	ri.Placeholder = "Type input for the running process and press Enter to send..."
 	ri.CharLimit = 1024
 
-	workspaceRoot, _ := os.Getwd()
-
 	m := &Model{
-		workspaceRoot:       workspaceRoot,
 		providerFingerprint: endpointFingerprint(providerName, modelName),
 		appState:            stateInput,
 		history:             activeSession.History,
-		provider:            provider,
+		agent:               ag,
+		stream:              newStreamState(),
 		textarea:            ta,
 		cmdTextarea:         cta,
 		sudoTextInput:       ti,
@@ -276,7 +206,6 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		activeModel:         modelName,
 		activePersona:       personaName,
 		fileConfig:          config.LoadFileConfig(),
-		mcpRegistry:         registry,
 	}
 
 	return m, nil
@@ -314,7 +243,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 
 	// ── Spinner tick ───────────────────────────────────────────────────────
 	case spinner.TickMsg:
-		if m.appState == stateStreaming || m.appState == stateExecuting || m.appState == stateExecutingTool || m.appState == stateExecutingTools {
+		if m.appState == stateStreaming || m.appState == stateExecutingTool {
 			var spCmd tea.Cmd
 			m.spinner, spCmd = m.spinner.Update(msg)
 			return m, spCmd
@@ -423,7 +352,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Keyboard shortcuts:"))
 						m.appendOutput("  Enter              Send message")
 						m.appendOutput("  Shift+Enter        Insert newline")
-						m.appendOutput("  Ctrl+C             Cancel stream / quit")
+						m.appendOutput("  Ctrl+C             Cancel the running turn / quit")
 						m.appendOutput("  Ctrl+L             Clear viewport")
 						m.appendOutput("  ?                  Toggle this help overlay")
 						m.appendOutput("  /read(file)        Attach file content to next message")
@@ -625,7 +554,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						if err != nil {
 							m.appendOutput(errorStyle.Render("✗ Failed to switch model: " + err.Error()))
 						} else {
-							m.provider = newProvider
+							m.agent.SetProvider(newProvider)
 							m.activeModel = arg
 							if m.activeSession != nil {
 								m.activeSession.Model = arg
@@ -671,7 +600,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						if err != nil {
 							m.appendOutput(errorStyle.Render("✗ Failed to switch provider: " + err.Error()))
 						} else {
-							m.provider = newProvider
+							m.agent.SetProvider(newProvider)
 							m.activeProvider = arg
 							m.activeModel = defaultModel
 							if m.activeSession != nil {
@@ -737,16 +666,16 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						arg := strings.TrimSpace(strings.TrimPrefix(input, "/approve-tools"))
 						switch arg {
 						case "on", "1", "yes":
-							m.autoApproveCommands = true
+							m.agent.SetAutoApprove(true)
 							m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
 								"⚡ Auto-approve enabled — commands, MCP tools, web_fetch and out-of-workspace reads run without prompting."))
 						case "off", "0", "no":
-							m.autoApproveCommands = false
+							m.agent.SetAutoApprove(false)
 							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
 								"✓ Auto-approve disabled — commands and sensitive tools require confirmation."))
 						default:
 							status := "off"
-							if m.autoApproveCommands {
+							if m.agent.AutoApprove() {
 								status = "on"
 							}
 							m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(
@@ -769,7 +698,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 					"history_turns", len(m.history),
 				)
 				m = m.submitPrompt(input)
-				return m, tea.Batch(m.startStreaming()...)
+				return m, m.startTurn()
 
 			case tea.KeyCtrlC:
 				return m, tea.Quit
@@ -830,387 +759,9 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 				return m, nil
 			}
 
-		case stateStreaming:
-			// Allow CtrlC to cancel the stream.
-			if msg.Type == tea.KeyCtrlC {
-				if m.cancelStream != nil {
-					m.cancelStream()
-				}
-				logger.L.Warn("stream cancelled by user")
-				m.appState = stateInput
-				m.appendOutput(errorStyle.Render("✗ Stream cancelled."))
-				m.refreshViewport()
-				return m, nil
-			}
-
-		case stateInputSudoPassword:
-			// Check for viewport scroll keys first to allow reading long outputs.
-			if msg.Type == tea.KeyPgUp {
-				m.viewport.LineUp(m.viewport.Height)
-				return m, nil
-			}
-			if msg.Type == tea.KeyCtrlU {
-				m.viewport.LineUp(m.viewport.Height / 2)
-				return m, nil
-			}
-			if msg.Type == tea.KeyPgDown {
-				m.viewport.LineDown(m.viewport.Height)
-				return m, nil
-			}
-			if msg.Type == tea.KeyCtrlD {
-				m.viewport.LineDown(m.viewport.Height / 2)
-				return m, nil
-			}
-			if msg.String() == "alt+up" {
-				m.viewport.LineUp(1)
-				return m, nil
-			}
-			if msg.String() == "alt+down" {
-				m.viewport.LineDown(1)
-				return m, nil
-			}
-
-			switch msg.Type {
-			case tea.KeyEsc:
-				logger.L.Info("sudo: user declined password input")
-				m.appState = stateInput
-				m.sudoTextInput.Reset()
-				m.textarea.Focus()
-				m.appendOutput(confirmStyle.Render("✗ Command cancelled (sudo password required)."))
-				m.refreshViewport()
-				if m.pendingLang == "" && m.pendingToolIdx < len(m.pendingToolCalls) {
-					// Tool-call path: the call still needs a result, or the next
-					// request is rejected for an unanswered tool_call.
-					call := m.pendingToolCalls[m.pendingToolIdx]
-					return m, func() tea.Msg {
-						return toolCallResultMsg{CallID: call.ID, Name: call.Name,
-							Result: "Command cancelled by user (sudo password not provided)."}
-					}
-				}
-				return m, nil
-			case tea.KeyEnter:
-				passwd := m.sudoTextInput.Value()
-				m.sudoPassword = passwd
-				m.sudoTextInput.Reset()
-				m.sudoTextInput.Blur()
-
-				// Now resume command execution
-				cmd := m.pendingCmd
-				if m.pendingLang == "" && len(m.pendingToolCalls) > 0 {
-					// Tool call path
-					call := m.pendingToolCalls[m.pendingToolIdx]
-					m.appendOutput(confirmStyle.Render("⚡ Executing…"))
-					return m, m.startRunCommand(call, cmd)
-				} else {
-					// Code block sandbox path
-					m.appState = stateExecuting
-					m.execStart = time.Now()
-					m.execTimeout = sandbox.DefaultTimeout
-					m.appendOutput(confirmStyle.Render("⚡ Executing…"))
-					m.refreshViewport()
-					return m, tea.Batch(m.runSandboxCmd(), m.spinner.Tick)
-				}
-			}
-
-			var tiCmd tea.Cmd
-			m.sudoTextInput, tiCmd = m.sudoTextInput.Update(msg)
-			return m, tiCmd
-
-		case stateConfirmingCmd:
-			// Check for viewport scroll keys first to allow reading long outputs.
-			if msg.Type == tea.KeyPgUp {
-				m.viewport.LineUp(m.viewport.Height)
-				return m, nil
-			}
-			if msg.Type == tea.KeyCtrlU {
-				m.viewport.LineUp(m.viewport.Height / 2)
-				return m, nil
-			}
-			if msg.Type == tea.KeyPgDown {
-				m.viewport.LineDown(m.viewport.Height)
-				return m, nil
-			}
-			if msg.Type == tea.KeyCtrlD {
-				m.viewport.LineDown(m.viewport.Height / 2)
-				return m, nil
-			}
-			if msg.String() == "alt+up" {
-				m.viewport.LineUp(1)
-				return m, nil
-			}
-			if msg.String() == "alt+down" {
-				m.viewport.LineDown(1)
-				return m, nil
-			}
-
-			switch msg.Type {
-			case tea.KeyEsc:
-				logger.L.Info("sandbox: user declined execution", "lang", m.pendingLang)
-				// If this was a run_command tool call, return an error result
-				// so the batch loop can continue with the next tool.
-				if m.pendingLang == "" && len(m.pendingToolCalls) > 0 {
-					call := m.pendingToolCalls[m.pendingToolIdx]
-					m.appState = stateInput
-					m.cmdTextarea.Blur()
-					m.textarea.Focus()
-					m.appendOutput(confirmStyle.Render("✗ Command skipped."))
-					m.refreshViewport()
-					return m, func() tea.Msg {
-						return toolCallResultMsg{CallID: call.ID, Name: call.Name,
-							Result: "Command skipped by user."}
-					}
-				}
-				m.appState = stateInput
-				m.cmdTextarea.Blur()
-				m.textarea.Focus()
-				m.appendOutput(confirmStyle.Render("✗ Command skipped."))
-				m.refreshViewport()
-				return m, nil
-			case tea.KeyEnter:
-				cmd := strings.TrimSpace(m.cmdTextarea.Value())
-				if cmd == "" {
-					return m, nil
-				}
-				// Tool-call run_command path (pendingLang == ""):
-				// run the command and feed the output back as a toolCallResultMsg.
-				if m.pendingLang == "" && len(m.pendingToolCalls) > 0 {
-					call := m.pendingToolCalls[m.pendingToolIdx]
-					logger.L.Info("run_command tool: user approved", "command", cmd)
-					if m.needsSudo(cmd) && m.sudoPassword == "" {
-						m.appState = stateInputSudoPassword
-						m.pendingCmd = cmd
-						m.sudoTextInput.Focus()
-						m.cmdTextarea.Blur()
-						m.appendOutput(confirmStyle.Render("🔒 Sudo password required to execute command."))
-						m.refreshViewport()
-						return m, nil
-					}
-					m.cmdTextarea.Blur()
-					m.appendOutput(confirmStyle.Render("⚡ Executing…"))
-					// The user may have edited the command.
-					return m, m.startRunCommand(call, cmd)
-				}
-				// Code-fence sandbox path.
-				logger.L.Info("sandbox: user approved execution",
-					"command", cmd,
-				)
-				m.pendingCmd = cmd
-				if m.needsSudo(cmd) && m.sudoPassword == "" {
-					m.appState = stateInputSudoPassword
-					m.sudoTextInput.Focus()
-					m.cmdTextarea.Blur()
-					m.appendOutput(confirmStyle.Render("🔒 Sudo password required to execute command."))
-					m.refreshViewport()
-					return m, nil
-				}
-				m.appState = stateExecuting
-				m.execStart = time.Now()
-				m.execTimeout = sandbox.DefaultTimeout
-				m.cmdTextarea.Blur()
-				m.appendOutput(confirmStyle.Render("⚡ Executing…"))
-				m.refreshViewport()
-				return m, tea.Batch(m.runSandboxCmd(), m.spinner.Tick)
-			case tea.KeyCtrlC:
-				return m, tea.Quit
-			}
-
-			var cmd tea.Cmd
-			m.cmdTextarea, cmd = m.cmdTextarea.Update(msg)
-			return m, cmd
-
-		case stateExecuting:
-			// Ctrl+I opens the runtime stdin prompt.
-			if msg.Type == tea.KeyCtrlI {
-				if m.stdinPipe != nil {
-					m.appState = stateRuntimeInput
-					m.runtimeInput.Reset()
-					m.runtimeInput.Focus()
-					return m, nil
-				}
-			}
-			// Ctrl+C kills the child process without quitting aig.
-			if msg.Type == tea.KeyCtrlC {
-				m.killExec()
-				logger.L.Warn("sandbox: execution killed by user")
-				m.appState = stateInput
-				m.appendOutput(errorStyle.Render("✗ Command killed."))
-				m.refreshViewport()
-				return m, nil
-			}
-
-		case stateExecutingTool:
-			// Ctrl+I opens the runtime stdin prompt when a pipe is active.
-			if msg.Type == tea.KeyCtrlI {
-				if m.stdinPipe != nil {
-					m.appState = stateRuntimeInput
-					m.runtimeInput.Reset()
-					m.runtimeInput.Focus()
-					return m, nil
-				}
-			}
-			// Ctrl+C cancels the running tool. Its goroutine still delivers
-			// exactly one toolCallResultMsg (cancellation propagates via ctx);
-			// the result handler then marks the rest of the batch as aborted
-			// and returns to input. (Previously this handler advanced
-			// pendingToolIdx itself, which skipped the next tool and produced
-			// a duplicate result.)
-			if msg.Type == tea.KeyCtrlC {
-				if m.toolAbortRequested {
-					return m, nil
-				}
-				m.toolAbortRequested = true
-				m.killExec()
-				logger.L.Warn("tool: execution aborted by user")
-				m.appendOutput(errorStyle.Render("✗ Aborting tool…"))
-				m.refreshViewport()
-				if len(m.pendingToolCalls) == 0 {
-					m.toolAbortRequested = false
-					m.resetToInput()
-				}
-				return m, nil
-			}
-
-		case stateRuntimeInput:
-			switch msg.Type {
-			case tea.KeyEsc:
-				// Go back to executing state without sending anything.
-				m.runtimeInput.Blur()
-				m.appState = stateExecuting
-				if len(m.pendingToolCalls) > 0 {
-					m.appState = stateExecutingTool
-				}
-				return m, nil
-			case tea.KeyEnter:
-				line := m.runtimeInput.Value()
-				m.runtimeInput.Reset()
-				m.runtimeInput.Blur()
-				m.appState = stateExecuting
-				if len(m.pendingToolCalls) > 0 {
-					m.appState = stateExecutingTool
-				}
-				if m.stdinPipe != nil {
-					m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("> " + line))
-					m.refreshViewport()
-					pipe := m.stdinPipe
-					return m, func() tea.Msg {
-						_, _ = fmt.Fprintln(pipe, line)
-						return nil
-					}
-				}
-				return m, nil
-			}
-			var riCmd tea.Cmd
-			m.runtimeInput, riCmd = m.runtimeInput.Update(msg)
-			return m, riCmd
-
-		case stateConfirmingWrite:
-			// Check for viewport scroll keys first to allow reading long outputs.
-			if msg.Type == tea.KeyPgUp {
-				m.viewport.LineUp(m.viewport.Height)
-				return m, nil
-			}
-			if msg.Type == tea.KeyCtrlU {
-				m.viewport.LineUp(m.viewport.Height / 2)
-				return m, nil
-			}
-			if msg.Type == tea.KeyPgDown {
-				m.viewport.LineDown(m.viewport.Height)
-				return m, nil
-			}
-			if msg.Type == tea.KeyCtrlD {
-				m.viewport.LineDown(m.viewport.Height / 2)
-				return m, nil
-			}
-			if msg.String() == "alt+up" {
-				m.viewport.LineUp(1)
-				return m, nil
-			}
-			if msg.String() == "alt+down" {
-				m.viewport.LineDown(1)
-				return m, nil
-			}
-
-			switch msg.Type {
-			case tea.KeyEnter:
-				// 'y' + Enter or just Enter when 'y' is pre-filled confirms the write.
-				cmd := strings.ToLower(strings.TrimSpace(m.cmdTextarea.Value()))
-				if cmd != "y" && cmd != "yes" {
-					return m, m.rejectPendingWrite()
-				}
-				pw := m.pendingWrite
-				callID := m.pendingWriteCallID
-				toolName := m.pendingWriteName
-				m.pendingWrite = nil
-				m.pendingWriteCallID = ""
-				m.appState = stateExecutingTool
-				m.execStart = time.Now()
-				m.execTimeout = 5 * time.Second
-				m.cmdTextarea.Blur()
-				m.textarea.Focus()
-				m.appendOutput(confirmStyle.Render("✍  Writing file…"))
-				m.refreshViewport()
-				m.execTimeout = 60 * time.Second // includes the post-edit check
-				var checks map[string]string
-				if m.fileConfig != nil {
-					checks = m.fileConfig.PostEditChecks
-				}
-				return m, tea.Batch(func() tea.Msg {
-					if err := CommitWrite(*pw); err != nil {
-						return toolCallResultMsg{CallID: callID, Name: toolName, Error: err}
-					}
-					result := fmt.Sprintf("Successfully wrote %s", pw.Path)
-					if len(pw.Notes) > 0 {
-						result += " (" + strings.Join(pw.Notes, "; ") + ")"
-					}
-					if check := PostEditCheck(context.Background(), pw.Path, checks); check != "" {
-						result += "\n\n" + check
-					}
-					return toolCallResultMsg{CallID: callID, Name: toolName, Result: result}
-				}, m.spinner.Tick)
-			case tea.KeyEsc:
-				return m, m.rejectPendingWrite()
-			case tea.KeyCtrlC:
-				return m, tea.Quit
-			}
-
-			var cmd tea.Cmd
-			m.cmdTextarea, cmd = m.cmdTextarea.Update(msg)
-			return m, cmd
-
-		case stateConfirmingTool:
-			if handled, vpCmd := m.handleScrollKeys(msg); handled {
-				return m, vpCmd
-			}
-			switch msg.Type {
-			case tea.KeyEnter:
-				answer := strings.ToLower(strings.TrimSpace(m.cmdTextarea.Value()))
-				call := m.pendingConfirmCall
-				m.pendingConfirmCall = nil
-				m.cmdTextarea.Blur()
-				if call == nil {
-					m.resetToInput()
-					return m, nil
-				}
-				if answer != "y" && answer != "yes" {
-					return m, m.denyTool(*call)
-				}
-				logger.L.Info("tool: user approved", "name", call.Name)
-				return m, m.runApprovedTool(*call)
-			case tea.KeyEsc:
-				call := m.pendingConfirmCall
-				m.pendingConfirmCall = nil
-				m.cmdTextarea.Blur()
-				if call == nil {
-					m.resetToInput()
-					return m, nil
-				}
-				return m, m.denyTool(*call)
-			case tea.KeyCtrlC:
-				return m, tea.Quit
-			}
-			var cmd tea.Cmd
-			m.cmdTextarea, cmd = m.cmdTextarea.Update(msg)
-			return m, cmd
+		case stateStreaming, stateExecutingTool, stateRuntimeInput, stateConfirmingCmd,
+			stateConfirmingWrite, stateConfirmingTool, stateInputSudoPassword:
+			return m.handleTurnKey(msg)
 
 		case stateSelecting:
 			switch msg.Type {
@@ -1271,331 +822,24 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			return m, nil
 		}
 
-	// ── Streaming token received ───────────────────────────────────────────
-	case tokenMsg:
-		tokenStr := string(msg)
-		if strings.HasPrefix(tokenStr, "\x00") {
-			m.nativeReasoningBuf += tokenStr[1:]
-		} else {
-			m.rawStreamBuffer += tokenStr
+	// ── Agent turn events ──────────────────────────────────────────────────
+	case agentEventMsg:
+		return m.handleAgentEvent(msg)
+
+	case agentClosedMsg:
+		// The channel closes right after DoneEvent; nothing else to do unless
+		// the turn ended without one (shouldn't happen).
+		if msg.turnID == m.turnID && m.events != nil {
+			return m.finishTurn(agent.DoneEvent{})
 		}
-
-		// Perform Plan-Action-Reflection dynamic parsing of the raw stream buffer
-		content, reasoning, inThink := SplitReasoning(m.rawStreamBuffer)
-		m.streamBuffer = content
-		m.reasoningBuffer = m.nativeReasoningBuf + reasoning
-		m.isDeliberating = inThink || (len(m.nativeReasoningBuf) > 0 && len(content) == 0)
-
-		// Show live streaming text (unformatted, fast) in viewport.
-		m.refreshViewportStreaming()
-		return m, waitForToken(m.tokenChan)
-
-	// ── Stream completed successfully ──────────────────────────────────────
-	case streamDoneMsg:
-		raw := m.streamBuffer
-		m.streamBuffer = ""
-		m.rawStreamBuffer = ""
-		m.nativeReasoningBuf = ""
-		m.isDeliberating = false
-
-		// Add assistant turn to history. ReasoningContent comes from the
-		// streamDoneMsg for non-tool turns (DeepSeek thinking models).
-		reasoning := msg.ReasoningContent
-		if reasoning == "" {
-			reasoning = m.reasoningBuffer
-		}
-		m.history = append(m.history, llm.Message{
-			Role:             llm.RoleAssistant,
-			Content:          raw,
-			ReasoningContent: reasoning,
-		})
-		m.reasoningBuffer = ""
-		logger.L.Info("stream completed", "response_len", len(raw))
-		m.saveSession()
-
-		// Render the full response through glamour.
-		rendered, err := m.renderer.Render(raw)
-		if err != nil {
-			rendered = raw // fallback to plain text
-		}
-
-		// Replace the streaming preview with the final rendered output.
-		if len(m.outputLines) > 0 && strings.Contains(m.outputLines[len(m.outputLines)-1], "…") {
-			m.outputLines = m.outputLines[:len(m.outputLines)-1]
-		}
-		label := assistantLabelStyle.Render("aig")
-		m.outputLines = append(m.outputLines, label)
-		if msg.ReasoningContent != "" {
-			m.outputLines = append(m.outputLines, thinkingStyle.Render(strings.TrimSpace(msg.ReasoningContent)))
-		}
-		m.outputLines = append(m.outputLines, strings.TrimRight(rendered, "\n"))
-		m.outputLines = append(m.outputLines, divider(m.width))
-
-		// Generate a title for fresh sessions
-		var titleCmd tea.Cmd
-		if m.activeSession != nil && m.activeSession.Name == "Untitled" && !m.titleGenerated {
-			hasUser := false
-			hasAssistant := false
-			for _, msg := range m.history {
-				if msg.Role == llm.RoleUser {
-					hasUser = true
-				} else if msg.Role == llm.RoleAssistant {
-					hasAssistant = true
-				}
-			}
-			if hasUser && hasAssistant {
-				m.titleGenerated = true
-				titleCmd = m.generateSessionTitleCmd()
-			}
-		}
-
-		// Check for executable code blocks.
-		if match := execLangPattern.FindStringSubmatch(raw); match != nil {
-			lang := match[1]
-			cmd := match[2]
-			m.pendingCmd = cmd
-			m.pendingLang = lang
-			m.appState = stateConfirmingCmd
-
-			// Highlight the block and prepare confirmation textarea.
-			block := codeBlockStyle.Render("```" + lang + "\n" + cmd + "\n```")
-			m.outputLines = append(m.outputLines, block)
-
-			m.cmdTextarea.SetValue(cmd)
-			m.textarea.Blur()
-			m.cmdTextarea.Focus()
-
-			m.refreshViewport()
-			return m, titleCmd
-		}
-
-		m.resetToInput()
-		return m, titleCmd
-
-	// ── Stream error ───────────────────────────────────────────────────────
-	case streamErrMsg:
-		m.streamBuffer = ""
-		m.reasoningBuffer = ""
-		m.pendingToolCalls = nil
-		m.pendingToolIdx = 0
-		m.lastErr = msg.err.Error()
-		logger.L.Error("stream error received", "error", msg.err)
-		m.appendOutput(errorStyle.Render("✗ Error: " + m.lastErr))
-		m.resetToInput()
 		return m, nil
 
-	// ── Sandbox execution result ───────────────────────────────────────────
-	case execResultMsg:
-		if msg.err != nil {
-			logger.L.Error("sandbox: execution error", "error", msg.err)
-			m.appendOutput(errorStyle.Render("✗ Execution error: " + msg.err.Error()))
-			errStr := strings.ToLower(msg.err.Error())
-			if strings.Contains(errStr, "incorrect password") || strings.Contains(errStr, "permission denied") {
-				m.sudoPassword = ""
-				m.appendOutput(errorStyle.Render("🔒 Incorrect password or permission denied. Sudo password cache cleared."))
-			}
-		} else {
-			logger.L.Info("sandbox: execution completed",
-				"lang", m.pendingLang,
-				"output_len", len(msg.output),
-			)
-			label := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("$ " + m.pendingLang)
-			m.appendOutput(label)
-			m.appendOutput(execResultStyle.Render(msg.output))
-
-			outStr := strings.ToLower(msg.output)
-			if strings.Contains(outStr, "incorrect password") || strings.Contains(outStr, "try again") {
-				m.sudoPassword = ""
-				m.appendOutput(errorStyle.Render("🔒 Sudo authentication failed. Sudo password cache cleared."))
-			}
-
-			// Feed output back into conversation as a system message.
-			m.history = append(m.history, llm.Message{
-				Role:    llm.RoleSystem,
-				Content: fmt.Sprintf("Command executed:\n```%s\n%s\n```\n\nOutput:\n%s", m.pendingLang, m.pendingCmd, msg.output),
-			})
-			m.saveSession()
+	case renderTickMsg:
+		if m.renderPending && m.appState == stateStreaming {
+			m.refreshViewportStreaming()
 		}
-		m.pendingCmd = ""
-		m.pendingLang = ""
-		// Close and discard the stdin pipe now that the command has finished.
-		if m.stdinPipe != nil {
-			_ = m.stdinPipe.Close()
-			m.stdinPipe = nil
-		}
-		m.resetToInput()
+		m.renderPending = false
 		return m, nil
-
-	// ── Tool batch received from LLM ───────────────────────────────────────
-	case toolCallBatchMsg:
-		// Clear the "…" streaming placeholder.
-		if len(m.outputLines) > 0 && strings.Contains(m.outputLines[len(m.outputLines)-1], "…") {
-			m.outputLines = m.outputLines[:len(m.outputLines)-1]
-		}
-
-		if msg.ReasoningContent != "" {
-			label := assistantLabelStyle.Render("aig")
-			m.outputLines = append(m.outputLines, label)
-			m.outputLines = append(m.outputLines, thinkingStyle.Render(strings.TrimSpace(msg.ReasoningContent)))
-			m.outputLines = append(m.outputLines, divider(m.width))
-			m.refreshViewport()
-		}
-
-		calls := msg.Calls
-		if len(calls) == 0 {
-			m.resetToInput()
-			return m, nil
-		}
-
-		// Record the full assistant turn (all tool calls in one message).
-		// ReasoningContent comes atomically from the toolCallBatchMsg itself.
-		assistantTCs := make([]llm.ToolCall, len(calls))
-		copy(assistantTCs, calls)
-		m.history = append(m.history, llm.Message{
-			Role:             llm.RoleAssistant,
-			ToolCalls:        assistantTCs,
-			ReasoningContent: msg.ReasoningContent,
-		})
-		m.reasoningBuffer = ""
-		m.rawStreamBuffer = ""
-		m.nativeReasoningBuf = ""
-		m.isDeliberating = false
-
-		// Store the batch and start processing from index 0.
-		m.pendingToolCalls = calls
-		m.pendingToolIdx = 0
-		m.loopErrorCount = 0
-		return m, m.processNextToolCall()
-
-	// ── Legacy single-tool path (kept for safety) ──────────────────────────
-	case toolCallMsg:
-		return m, func() tea.Msg {
-			return toolCallBatchMsg{Calls: []llm.ToolCall{msg.Call}}
-		}
-
-	case toolCallResultMsg:
-		resContent := msg.Result
-		success := msg.Error == nil
-
-		// Telemetry calculation
-		var args map[string]any
-		if m.pendingToolIdx < len(m.pendingToolCalls) {
-			args = m.pendingToolCalls[m.pendingToolIdx].Args
-		}
-		argsHash := hashArguments(args)
-		duration := time.Since(m.execStart)
-
-		if !success {
-			m.consecutiveErrors++
-			m.loopErrorCount++
-		} else {
-			m.consecutiveErrors = 0
-		}
-
-		telemetry := ToolTelemetry{
-			Name:     msg.Name,
-			ArgsHash: argsHash,
-			Duration: duration,
-			Success:  success,
-		}
-		m.toolTelemetry = append(m.toolTelemetry, telemetry)
-
-		logger.L.Info("tool execution telemetry",
-			"name", telemetry.Name,
-			"args_hash", telemetry.ArgsHash,
-			"duration_ms", telemetry.Duration.Milliseconds(),
-			"success", telemetry.Success,
-			"loop_error_count", m.loopErrorCount,
-		)
-
-		if msg.Error != nil {
-			resContent = fmt.Sprintf("Error: %s", msg.Error.Error())
-			m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ Tool %s failed", msg.Name)))
-			if msg.Name == "run_command" {
-				m.appendOutput(errorStyle.Render("✗ " + msg.Error.Error()))
-				errStr := strings.ToLower(msg.Error.Error())
-				if strings.Contains(errStr, "incorrect password") || strings.Contains(errStr, "permission denied") {
-					m.sudoPassword = ""
-					m.appendOutput(errorStyle.Render("🔒 Incorrect password or permission denied. Sudo password cache cleared."))
-				}
-			}
-		} else {
-			m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s done", msg.Name)))
-			if i := strings.Index(msg.Result, "Post-edit check"); i >= 0 {
-				style := lipgloss.NewStyle().Foreground(colorSubtext)
-				if strings.Contains(msg.Result[i:], "FAILED") {
-					style = errorStyle
-				}
-				m.appendOutput(style.Render("  " + strings.ReplaceAll(msg.Result[i:], "\n", "\n  ")))
-			}
-			if msg.Name == "run_command" {
-				m.appendOutput(execResultStyle.Render(msg.Result))
-				outStr := strings.ToLower(msg.Result)
-				if strings.Contains(outStr, "incorrect password") || strings.Contains(outStr, "try again") {
-					m.sudoPassword = ""
-					m.appendOutput(errorStyle.Render("🔒 Sudo authentication failed. Sudo password cache cleared."))
-				}
-			}
-		}
-		// Close the stdin pipe for this tool (if it had one).
-		if m.stdinPipe != nil {
-			_ = m.stdinPipe.Close()
-			m.stdinPipe = nil
-		}
-		m.refreshViewport()
-
-		m.history = append(m.history, llm.Message{
-			Role:       llm.RoleTool,
-			Content:    resContent,
-			ToolCallID: msg.CallID,
-			ToolName:   msg.Name,
-		})
-		m.saveSession()
-
-		// User pressed Ctrl+C while this tool ran: answer the remaining calls
-		// and hand control back without calling the model again.
-		if m.toolAbortRequested {
-			m.toolAbortRequested = false
-			m.answerRemainingToolCalls(m.pendingToolIdx+1, "Aborted by user before execution.")
-			m.pendingToolCalls = nil
-			m.pendingToolIdx = 0
-			m.saveSession()
-			m.appendOutput(errorStyle.Render("✗ Tool aborted."))
-			m.resetToInput()
-			return m, nil
-		}
-
-		// 3 consecutive errors breaker
-		if m.consecutiveErrors >= 3 {
-			m.appendOutput(errorStyle.Render("⚠️ Loop Breaker Circuit: Blocked execution due to 3 consecutive tool errors"))
-			m.appendOutput(errorStyle.Render("Injecting error warning context to model to break failure cascade..."))
-			m.refreshViewport()
-
-			// Every tool_call in the assistant turn must get a result, or
-			// OpenAI-compatible APIs reject the next request (HTTP 400).
-			m.answerRemainingToolCalls(m.pendingToolIdx+1, "Skipped: loop breaker halted execution after 3 consecutive errors.")
-			m.pendingToolCalls = nil
-			m.pendingToolIdx = 0
-			m.consecutiveErrors = 0
-
-			m.history = append(m.history, llm.Message{
-				Role:    llm.RoleSystem,
-				Content: "⚠️ Loop Breaker Alert: The last 3 consecutive tool execution attempts resulted in errors. To prevent cascading failures and resource waste, execution has been intercepted and blocked. Please review the errors, fix your logic/syntax/arguments, and reflect on why the previous attempts failed before selecting a new path.",
-			})
-			m.saveSession()
-
-			return m, tea.Batch(m.startStreaming()...)
-		}
-
-		// Advance to the next tool in the batch, or re-stream if all done.
-		m.pendingToolIdx++
-		if m.pendingToolIdx < len(m.pendingToolCalls) {
-			return m, m.processNextToolCall()
-		}
-		// All tools in this batch are done — give the LLM the full results.
-		m.pendingToolCalls = nil
-		m.pendingToolIdx = 0
-		return m, tea.Batch(m.startStreaming()...)
 
 	case modelListMsg:
 		return m.showModelPicker(msg), nil
@@ -1672,110 +916,18 @@ func (m Model) View() string {
 	case stateInput:
 		b.WriteString(inputActiveStyle.Render(m.textarea.View()))
 	case stateStreaming:
-		b.WriteString(inputStyle.Render(
-			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render("streaming…"),
-		))
-	case stateConfirmingCmd:
-		var label string
-		if m.pendingLang != "" {
-			label = fmt.Sprintf("Review %s block (Enter to run, Esc to cancel, Shift+Enter for newline):", m.pendingLang)
-		} else {
-			label = "Review command (Enter to run, Esc to cancel, Shift+Enter for newline):"
-		}
-		b.WriteString(inputActiveStyle.Render(
-			lipgloss.JoinVertical(lipgloss.Left,
-				confirmStyle.Render(label),
-				m.cmdTextarea.View(),
-			),
-		))
-	case stateConfirmingWrite:
-		path := ""
-		if m.pendingWrite != nil {
-			path = m.pendingWrite.Path
-		}
-		b.WriteString(inputActiveStyle.Render(
-			lipgloss.JoinVertical(lipgloss.Left,
-				confirmStyle.Render(fmt.Sprintf("💾 Write to %s? Type 'y' and Enter to confirm, Esc to cancel:", path)),
-				m.cmdTextarea.View(),
-			),
-		))
-	case stateConfirmingTool:
-		b.WriteString(inputActiveStyle.Render(
-			lipgloss.JoinVertical(lipgloss.Left,
-				confirmStyle.Render("Allow this tool call? Type 'y' and Enter to allow, Esc to deny:"),
-				m.cmdTextarea.View(),
-			),
-		))
-	case stateInputSudoPassword:
-		b.WriteString(inputActiveStyle.Render(
-			lipgloss.JoinVertical(lipgloss.Left,
-				confirmStyle.Render("🔒 This command requires sudo. Enter password (Esc to cancel):"),
-				m.sudoTextInput.View(),
-			),
-		))
-	case stateExecuting:
-		icon, desc := m.getExecutionIndicator(m.pendingCmd)
-		elapsed := time.Since(m.execStart)
-		cmdMsg := desc
-		if m.pendingCmd != "" {
-			trimmedCmd := m.pendingCmd
-			if len(trimmedCmd) > 50 {
-				trimmedCmd = trimmedCmd[:47] + "..."
-			}
-			cmdMsg = fmt.Sprintf("%s: %s", desc, trimmedCmd)
-		}
-		var execHints []string
-		execHints = append(execHints, fmt.Sprintf("%s %s %s (elapsed: %.1fs)", m.spinner.View(), icon, cmdMsg, elapsed.Seconds()))
-		if m.stdinPipe != nil {
-			execHints = append(execHints, lipgloss.NewStyle().Foreground(colorSubtext).Render(
-				"Ctrl+I to send stdin · Ctrl+C to abort"))
-		} else {
-			execHints = append(execHints, lipgloss.NewStyle().Foreground(colorSubtext).Render(
-				"Ctrl+C to abort"))
+		label := "streaming…"
+		if m.cancelling {
+			label = "cancelling…"
+		} else if m.isDeliberating {
+			label = "thinking…"
 		}
 		b.WriteString(inputStyle.Render(
-			lipgloss.JoinVertical(lipgloss.Left, execHints...),
+			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render(label),
 		))
-	case stateExecutingTool:
-		elapsed := time.Since(m.execStart)
-		toolName := "tool"
-		command := ""
-		if len(m.pendingToolCalls) > 0 && m.pendingToolIdx < len(m.pendingToolCalls) {
-			call := m.pendingToolCalls[m.pendingToolIdx]
-			toolName = call.Name
-			if toolName == "run_command" {
-				command, _ = call.Args["command"].(string)
-			}
-		}
-		var icon, desc string
-		if toolName == "run_command" && command != "" {
-			icon, desc = m.getExecutionIndicator(command)
-			if len(command) > 50 {
-				command = command[:47] + "..."
-			}
-			desc = fmt.Sprintf("%s: %s", desc, command)
-		} else {
-			icon = "⚙"
-			desc = fmt.Sprintf("executing tool: %s…", toolName)
-		}
-		b.WriteString(inputStyle.Render(
-			lipgloss.JoinVertical(lipgloss.Left,
-				fmt.Sprintf("%s %s %s (elapsed: %.1fs)", m.spinner.View(), icon, desc, elapsed.Seconds()),
-				lipgloss.NewStyle().Foreground(colorSubtext).Render(
-					func() string {
-						if m.stdinPipe != nil {
-							return "Ctrl+I to send stdin \u00b7 Ctrl+C to abort"
-						}
-						return "Ctrl+C to abort"
-					}()),
-			),
-		))
-	case stateExecutingTools:
-		remaining := len(m.pendingToolCalls) - m.pendingToolIdx
-		b.WriteString(inputStyle.Render(
-			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render(
-				fmt.Sprintf("executing tools… (%d remaining)", remaining)),
-		))
+	case stateConfirmingCmd, stateConfirmingWrite, stateConfirmingTool, stateInputSudoPassword,
+		stateExecutingTool, stateRuntimeInput:
+		b.WriteString(m.viewTurnInput())
 	case stateSelecting:
 		var items []string
 		title := fmt.Sprintf("Select %s (Up/Down arrows to navigate, Enter to select, Esc to cancel):", m.selectionType)
@@ -1808,15 +960,6 @@ func (m Model) View() string {
 		b.WriteString(inputActiveStyle.Render(
 			lipgloss.JoinVertical(lipgloss.Left, items...),
 		))
-	case stateRuntimeInput:
-		hint := lipgloss.NewStyle().Foreground(colorSubtext).Render(
-			"\u2328\ufe0f  Type a line to send to the running process (Enter to send \u00b7 Esc to return)")
-		b.WriteString(inputActiveStyle.Render(
-			lipgloss.JoinVertical(lipgloss.Left,
-				hint,
-				m.runtimeInput.View(),
-			),
-		))
 	}
 
 	return b.String()
@@ -1835,7 +978,7 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 		if err != nil {
 			m.appendOutput(errorStyle.Render("✗ Failed to switch model: " + err.Error()))
 		} else {
-			m.provider = newProvider
+			m.agent.SetProvider(newProvider)
 			m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
 				fmt.Sprintf("✓ Model switched to: %s", id)))
 		}
@@ -1857,7 +1000,7 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 			m.activeModel = s.Model
 		}
 		if newProvider, err := m.buildProvider(m.activeProvider, m.activeModel); err == nil {
-			m.provider = newProvider
+			m.agent.SetProvider(newProvider)
 		}
 		m.loadHistory(s.History, false)
 		m.titleGenerated = false
@@ -1870,7 +1013,7 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 		if err != nil {
 			m.appendOutput(errorStyle.Render("✗ Failed to switch provider: " + err.Error()))
 		} else {
-			m.provider = newProvider
+			m.agent.SetProvider(newProvider)
 			m.activeProvider = id
 			m.activeModel = defaultModel
 			if m.activeSession != nil {
@@ -1920,7 +1063,10 @@ func (m Model) generateSessionTitleCmd() tea.Cmd {
 		return nil
 	}
 
-	provider := m.provider
+	provider := m.agent.Provider()
+	if provider == nil {
+		return nil
+	}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -2021,12 +1167,9 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 						command, _ := call.Args["command"].(string)
 						m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Render(
 							fmt.Sprintf("⚙ Tool: run_command: %s", command)))
-					} else if call.Name == "write_file" || call.Name == "edit_file" {
+					} else if tools.IsWriteTool(call.Name) {
 						path, _ := call.Args["path"].(string)
-						icon := "💾"
-						if call.Name == "edit_file" {
-							icon = "✏️ "
-						}
+						icon := toolIcon(call.Name)
 						m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
 							fmt.Sprintf("%s %s: %s", icon, call.Name, path)))
 					} else {
@@ -2058,95 +1201,9 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 		}
 	}
 
-	// Restore active/in-flight states which are not yet in m.history
-	switch m.appState {
-	case stateStreaming:
-		if m.streamBuffer == "" {
-			m.outputLines = append(m.outputLines, assistantLabelStyle.Render("aig")+" "+spinnerStyle.Render("…"))
-			m.refreshViewport()
-		} else {
-			m.refreshViewportStreaming()
-		}
+	// Re-add in-flight turn state (streaming text, pending approval, …).
+	if m.restoreTurnOutput() {
 		return
-
-	case stateConfirmingCmd:
-		if m.pendingLang != "" {
-			block := codeBlockStyle.Render("```" + m.pendingLang + "\n" + m.pendingCmd + "\n```")
-			m.outputLines = append(m.outputLines, block)
-		} else {
-			m.outputLines = append(m.outputLines, confirmStyle.Render(fmt.Sprintf("🔧 run_command: %s", m.pendingCmd)))
-			m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorSubtext).Render(
-				"Enter to execute · Esc to cancel · edit command if needed"))
-		}
-
-	case stateConfirmingWrite:
-		if m.pendingWrite != nil {
-			icon := "💾"
-			toolName := "write_file"
-			if len(m.pendingToolCalls) > 0 && m.pendingToolIdx < len(m.pendingToolCalls) {
-				toolName = m.pendingToolCalls[m.pendingToolIdx].Name
-				if toolName == "edit_file" {
-					icon = "✏️ "
-				}
-			}
-			m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
-				fmt.Sprintf("%s %s: %s", icon, toolName, m.pendingWrite.Path)))
-
-			if m.pendingWrite.Diff != "" && m.pendingWrite.Diff != "(no changes)" {
-				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorSubtext).Render("Diff preview:"))
-				m.outputLines = append(m.outputLines, codeBlockStyle.Render(m.pendingWrite.Diff))
-			} else {
-				preview := m.pendingWrite.Content
-				if len(preview) > 400 {
-					preview = preview[:400] + "\n...(truncated)"
-				}
-				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorSubtext).Render(
-					fmt.Sprintf("Content preview (%d bytes):", len(m.pendingWrite.Content))))
-				m.outputLines = append(m.outputLines, codeBlockStyle.Render(preview))
-			}
-		}
-
-	case stateConfirmingTool:
-		if m.pendingConfirmCall != nil {
-			args, _ := json.MarshalIndent(m.pendingConfirmCall.Args, "", "  ")
-			m.outputLines = append(m.outputLines,
-				confirmStyle.Render("⚠ Approval needed: "+m.pendingConfirmCall.Name),
-				codeBlockStyle.Render(truncateUTF8(string(args), 1500)))
-		}
-
-	case stateExecuting:
-		if m.pendingLang != "" {
-			block := codeBlockStyle.Render("```" + m.pendingLang + "\n" + m.pendingCmd + "\n```")
-			m.outputLines = append(m.outputLines, block)
-		} else {
-			m.outputLines = append(m.outputLines, confirmStyle.Render(fmt.Sprintf("🔧 run_command: %s", m.pendingCmd)))
-		}
-
-	case stateExecutingTool, stateExecutingTools:
-		if len(m.pendingToolCalls) > 0 && m.pendingToolIdx < len(m.pendingToolCalls) {
-			call := m.pendingToolCalls[m.pendingToolIdx]
-			if call.Name == "run_command" {
-				command, _ := call.Args["command"].(string)
-				if m.autoApproveCommands {
-					m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Render(
-						fmt.Sprintf("⚡ run_command (auto): %s", command)))
-				} else {
-					m.outputLines = append(m.outputLines, confirmStyle.Render(
-						fmt.Sprintf("🔧 run_command: %s", command)))
-				}
-			} else if call.Name == "write_file" || call.Name == "edit_file" {
-				path, _ := call.Args["path"].(string)
-				icon := "💾"
-				if call.Name == "edit_file" {
-					icon = "✏️ "
-				}
-				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
-					fmt.Sprintf("%s %s: %s", icon, call.Name, path)))
-			} else {
-				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Render(
-					fmt.Sprintf("⚙ Tool: %s", call.Name)))
-			}
-		}
 	}
 
 	if keepScroll {
@@ -2156,20 +1213,9 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 	}
 }
 
-// needsSudo reports whether aig must collect a sudo password itself before
-// running cmd. With a graphical askpass helper (KDE ksshaskpass) available,
-// sudo prompts via a desktop dialog instead and aig never sees the password.
-func (m *Model) needsSudo(cmd string) bool {
-	if sandbox.AskpassHelper() != "" {
-		return false
-	}
-	matched, _ := regexp.MatchString(`\bsudo\b`, cmd)
-	return matched
-}
-
 func (m *Model) getExecutionIndicator(cmd string) (string, string) {
 	cmdLower := strings.ToLower(cmd)
-	isSudo := m.needsSudo(cmd)
+	isSudo := sandbox.UsesSudo(cmd)
 	isDownload := false
 	downloadKeywords := []string{
 		"curl", "wget", "git clone", "apt-get install", "apt install",
@@ -2219,12 +1265,8 @@ func (m *Model) recalculateDimensions() {
 		inputHeight = 8
 	case stateInputSudoPassword:
 		inputHeight = 4
-	case stateExecuting:
-		inputHeight = 4
 	case stateExecutingTool:
 		inputHeight = 4
-	case stateExecutingTools:
-		inputHeight = 3
 	case stateRuntimeInput:
 		inputHeight = 4
 	case stateSelecting:
@@ -2287,366 +1329,13 @@ func (m Model) submitPrompt(input string) Model {
 	})
 	m.saveSession()
 
-	// Loop-breaker counters are per user turn.
-	m.consecutiveSameCalls = 0
-	m.consecutiveErrors = 0
-	m.lastToolName = ""
-	m.lastArgsHash = ""
-
 	label := userLabelStyle.Render("You")
 	m.outputLines = append(m.outputLines,
 		label,
 		lipgloss.NewStyle().Foreground(colorText).Render(input),
 		divider(m.width),
-		assistantLabelStyle.Render("aig")+" "+spinnerStyle.Render("…"),
 	)
 	return m
-}
-
-// startStreaming kicks off the LLM goroutine and the waitForToken relay.
-func (m *Model) startStreaming() []tea.Cmd {
-	ch := make(chan string, 64)
-	m.tokenChan = ch
-	m.appState = stateStreaming
-	m.streamBuffer = ""
-	m.rawStreamBuffer = ""
-	m.nativeReasoningBuf = ""
-	m.isDeliberating = false
-
-	ctx, cancel := context.WithCancel(context.Background())
-	m.cancelStream = cancel
-
-	// Pick up a changed API key from config/env, but only rebuild the client
-	// when provider, model, or key actually changed.
-	if fp := endpointFingerprint(m.activeProvider, m.activeModel); fp != "" && fp != m.providerFingerprint {
-		if newProvider, err := m.buildProvider(m.activeProvider, m.activeModel); err == nil {
-			m.provider = newProvider
-		}
-	}
-
-	// Snapshot everything the goroutine needs. It must not read the live
-	// Model, which the Update loop keeps mutating.
-	provider := m.provider
-	contextBlock := m.contextBlock
-	history := append([]llm.Message(nil), m.history...)
-	registry := m.mcpRegistry
-
-	// Background goroutine — calls the LLM provider.
-	streamCmd := func() tea.Msg {
-		// Prune to a default context limit (100k tokens approx ~400k chars)
-		prunedHistory := llm.PruneHistory(history, 100000)
-		// Build the combined tool list: native sandbox tools + any MCP-registered tools.
-		// If no MCP registry is wired (nil), this degrades cleanly to AgentTools() alone.
-		tools := AgentTools()
-		if registry != nil {
-			tools = append(tools, registry.LLMTools()...)
-		}
-
-		// Append the session context block (environment + project
-		// instructions) to the first system message of the OUTGOING copy only,
-		// so history and saved sessions stay clean.
-		outgoingHistory := withContextBlock(prunedHistory, contextBlock)
-
-		toolCalls, reasoningContent, err := provider.StreamChat(ctx, outgoingHistory, tools, ch)
-		if err != nil {
-			return streamErrMsg{err: err}
-		}
-		if len(toolCalls) > 0 {
-			return toolCallBatchMsg{Calls: toolCalls, ReasoningContent: reasoningContent}
-		}
-		return streamDoneMsg{ReasoningContent: reasoningContent}
-	}
-
-	return []tea.Cmd{
-		streamCmd,
-		waitForToken(ch),
-		m.spinner.Tick,
-	}
-}
-
-// waitForToken is the relay command: it blocks until one token arrives on ch
-// (or ch is closed), then returns a tokenMsg. The Update loop re-issues this
-// command after each token to achieve continuous streaming.
-func waitForToken(ch chan string) tea.Cmd {
-	return func() tea.Msg {
-		token, ok := <-ch
-		if !ok {
-			// Channel closed — stream done.
-			return nil
-		}
-		return tokenMsg(token)
-	}
-}
-
-// killExec cancels any in-flight sandbox child process and cleans up the stdin pipe.
-func (m *Model) killExec() {
-	if m.stdinPipe != nil {
-		_ = m.stdinPipe.Close()
-		m.stdinPipe = nil
-	}
-	if m.cancelExec != nil {
-		m.cancelExec()
-		m.cancelExec = nil
-	}
-}
-
-// resetToInput transitions the TUI back to the interactive input state.
-// It must be called from every path that returns to stateInput to ensure
-// the main textarea is re-focused and any in-flight streams are cancelled.
-func (m *Model) resetToInput() {
-	// Cancel any in-flight LLM stream context so the goroutine exits cleanly.
-	if m.cancelStream != nil {
-		m.cancelStream()
-		m.cancelStream = nil
-	}
-	m.appState = stateInput
-	// Re-focus the main input area so the user can type immediately.
-	m.cmdTextarea.Blur()
-	m.textarea.Focus()
-	m.refreshViewport()
-}
-
-// runSandboxCmd executes the pending command in the sandbox.
-// It creates a cancellable context, an io.Pipe for stdin (enabling runtime
-// input injection via Ctrl+I), and stores both so the TUI can kill or feed
-// the child process without quitting the whole app.
-func (m *Model) runSandboxCmd() tea.Cmd {
-	cmd := m.pendingCmd
-	ctx, cancel := context.WithCancel(context.Background())
-	m.cancelExec = cancel
-
-	// Create a pipe: the TUI writes to pipeW, the subprocess reads from pipeR.
-	pipeR, pipeW := io.Pipe()
-	m.stdinPipe = pipeW
-
-	// Pre-seed the sudo password if needed, then keep the write end open so
-	// the process can receive further input via Ctrl+I. io.Pipe writes block
-	// until read, so this must not run on the Update goroutine.
-	password := m.fallbackSudoPassword()
-	seedStdin(pipeW, password)
-
-	return func() tea.Msg {
-		result, err := sandbox.ExecuteWithStdin(ctx, cmd, pipeR, sandbox.Options{
-			SudoPassword: password,
-		})
-		_ = pipeR.Close()
-		if err != nil {
-			return execResultMsg{err: err}
-		}
-		return execResultMsg{output: result.Combined()}
-
-	}
-}
-
-// processNextToolCall picks up the next call in pendingToolCalls and routes it:
-//   - MCP tools        → stateConfirmingTool unless trusted/auto-approve, then Registry.Call()
-//   - run_command      → auto-approve (execute now) or stateConfirmingCmd
-//   - write_file / edit_file → stateConfirmingWrite with diff preview
-//   - web_fetch / reads outside the workspace → stateConfirmingTool unless auto-approve
-//   - everything else  → execute immediately, return toolCallResultMsg
-func (m *Model) processNextToolCall() tea.Cmd {
-	if m.pendingToolIdx >= len(m.pendingToolCalls) {
-		return func() tea.Msg { return toolCallResultMsg{} }
-	}
-	call := m.pendingToolCalls[m.pendingToolIdx]
-	argsHash := hashArguments(call.Args)
-
-	if call.Name == m.lastToolName && argsHash == m.lastArgsHash {
-		m.consecutiveSameCalls++
-	} else {
-		m.consecutiveSameCalls = 1
-		m.lastToolName = call.Name
-		m.lastArgsHash = argsHash
-	}
-
-	if m.consecutiveSameCalls >= 3 {
-		m.appendOutput(errorStyle.Render(fmt.Sprintf("⚠️ Loop Breaker Circuit: Blocked 3 consecutive identical calls to %q", call.Name)))
-		m.appendOutput(errorStyle.Render("Injecting warning context to model to break repetition..."))
-		m.refreshViewport()
-
-		// Answer this call and the rest of the batch so no tool_call is left
-		// without a result (OpenAI-compatible APIs reject that with HTTP 400).
-		m.answerRemainingToolCalls(m.pendingToolIdx, "Skipped: loop breaker blocked a repeated identical call.")
-		m.pendingToolCalls = nil
-		m.pendingToolIdx = 0
-		m.consecutiveSameCalls = 0
-		m.lastToolName = ""
-		m.lastArgsHash = ""
-
-		m.history = append(m.history, llm.Message{
-			Role:    llm.RoleSystem,
-			Content: fmt.Sprintf("⚠️ Loop Breaker Alert: You have attempted to call the tool %q with arguments %v 3 times consecutively. This action has been intercepted and blocked. Please stop executing this loop, re-evaluate your debugging strategy, verify all paths/files, and reflect on why the previous attempts failed before selecting a new path.", call.Name, call.Args),
-		})
-		m.saveSession()
-
-		return tea.Batch(m.startStreaming()...)
-	}
-
-	// ── MCP tool dispatch ──────────────────────────────────────────────────────────
-	// MCP tools are checked before the native switch so that registry-registered
-	// names always win, even if a name ever collides with a built-in tool.
-	if m.mcpRegistry != nil && m.mcpRegistry.IsMCPTool(call.Name) {
-		if !m.autoApproveCommands && !m.mcpRegistry.IsTrusted(call.Name) {
-			return m.askToolApproval(call, "🔌 MCP tool "+call.Name)
-		}
-		return m.mcpToolCallCmd(call)
-	}
-
-	switch call.Name {
-	case "run_command":
-		command, _ := call.Args["command"].(string)
-
-		if m.autoApproveCommands {
-			if m.needsSudo(command) && m.sudoPassword == "" {
-				m.appState = stateInputSudoPassword
-				m.pendingCmd = command
-				m.pendingLang = "" // tool call
-				m.sudoTextInput.Focus()
-				m.textarea.Blur()
-				m.appendOutput(confirmStyle.Render("🔒 Sudo password required to execute auto-approved command."))
-				m.refreshViewport()
-				return nil
-			}
-
-			// Execute immediately without asking.
-			m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
-				fmt.Sprintf("⚡ run_command (auto): %s", command)))
-			return m.startRunCommand(call, command)
-		}
-
-		// Prompt the user — reuse stateConfirmingCmd.
-		m.appState = stateConfirmingCmd
-		m.pendingCmd = command
-		m.pendingLang = "" // signals "tool call, not a code-fence"
-		m.cmdTextarea.SetValue(command)
-		m.textarea.Blur()
-		m.cmdTextarea.Focus()
-		m.appendOutput(confirmStyle.Render(fmt.Sprintf("🔧 run_command: %s", command)))
-		m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(
-			"Enter to execute · Esc to cancel · edit command if needed"))
-		m.refreshViewport()
-		// Return nil — execution continues when the user presses Enter (handled in
-		// stateConfirmingCmd KeyEnter, which calls runSandboxCmd → execResultMsg).
-		// But we need to deliver the result back as a toolCallResultMsg, not execResultMsg.
-		// So we set a special pending state marker here and intercept in execResultMsg handler.
-		// Simpler: in stateConfirmingCmd Enter, detect pendingLang=="" to know it's a tool call.
-		return nil
-
-	case "write_file", "edit_file", "multi_edit":
-		_, pw, prepErr := ExecuteToolWithWrite(call)
-		if pw == nil {
-			// Invalid arguments or no match: report the real reason so the
-			// model can fix its call.
-			if prepErr == nil || prepErr == ErrWriteConfirmationRequired {
-				prepErr = fmt.Errorf("%s: failed to prepare write", call.Name)
-			}
-			return func() tea.Msg {
-				return toolCallResultMsg{CallID: call.ID, Name: call.Name, Error: prepErr}
-			}
-		}
-		m.pendingWrite = pw
-		m.pendingWriteCallID = call.ID
-		m.pendingWriteName = call.Name
-
-		icon := "💾"
-		if call.Name == "edit_file" || call.Name == "multi_edit" {
-			icon = "✏️ "
-		}
-		m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
-			fmt.Sprintf("%s %s: %s", icon, call.Name, pw.Path)))
-		for _, note := range pw.Notes {
-			m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("  ℹ " + note))
-		}
-
-		// Show diff if available, otherwise show content preview.
-		if pw.Diff != "" && pw.Diff != "(no changes)" {
-			m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("Diff preview:"))
-			m.appendOutput(codeBlockStyle.Render(pw.Diff))
-		} else {
-			preview := pw.Content
-			if len(preview) > 400 {
-				preview = preview[:400] + "\n...(truncated)"
-			}
-			m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(
-				fmt.Sprintf("Content preview (%d bytes):", len(pw.Content))))
-			m.appendOutput(codeBlockStyle.Render(preview))
-		}
-
-		m.appState = stateConfirmingWrite
-		m.cmdTextarea.SetValue("y")
-		m.textarea.Blur()
-		m.cmdTextarea.Focus()
-		m.refreshViewport()
-		return nil
-
-	default:
-		if !m.autoApproveCommands {
-			if needs, reason := NativeToolNeedsApproval(call, m.workspaceRoot); needs {
-				return m.askToolApproval(call, "⚙ "+call.Name+" — "+reason)
-			}
-		}
-		return m.runNativeTool(call)
-	}
-}
-
-// runNativeTool executes a read-only/web native tool in a background command.
-func (m *Model) runNativeTool(call llm.ToolCall) tea.Cmd {
-	m.appState = stateExecutingTool
-	m.execStart = time.Now()
-	m.execTimeout = 5 * time.Second
-	m.cancelExec = nil
-	m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
-		fmt.Sprintf("⚙ Tool: %s", call.Name)))
-	m.refreshViewport()
-	callCopy := call
-	return tea.Batch(func() tea.Msg {
-		resultStr, _, err := ExecuteToolWithWrite(callCopy)
-		if err != nil {
-			return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
-		}
-		return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: resultStr}
-	}, m.spinner.Tick)
-}
-
-// mcpToolCallCmd dispatches a single MCP tool call as a non-blocking tea.Cmd.
-//
-// The RPC runs in a background goroutine; the UI transitions to stateExecutingTool
-// and shows a spinner while waiting. When the goroutine finishes (success, error,
-// or context cancellation via Ctrl+C), it delivers a toolCallResultMsg back to
-// the Update loop — the same message type used by all native tool paths — so
-// the existing pendingToolIdx advancement and re-streaming logic is reused exactly.
-//
-// Ctrl+C cancellation: the existing stateExecutingTool key handler calls
-// killExec(), which invokes m.cancelExec(). Since we store the context's cancel
-// func in m.cancelExec, this propagates context.Canceled into registry.Call(),
-// unblocking the goroutine within one RPC round-trip.
-func (m *Model) mcpToolCallCmd(call llm.ToolCall) tea.Cmd {
-	m.appState = stateExecutingTool
-	m.execStart = time.Now()
-	// MCP tools have no inherent execution timeout — the user's Ctrl+C is the
-	// escape valve. Set execTimeout generously so the elapsed timer stays sane.
-	m.execTimeout = 60 * time.Second
-
-	m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
-		fmt.Sprintf("🔌 MCP: %s", call.Name)))
-	m.refreshViewport()
-
-	// Wire cancellation into the existing killExec() infrastructure so that
-	// Ctrl+C aborts the in-flight RPC without any changes to the key handler.
-	ctx, cancel := context.WithCancel(context.Background())
-	m.cancelExec = cancel
-
-	// Capture pointers — do not close over the full Model value.
-	registry := m.mcpRegistry
-	callCopy := call
-	return tea.Batch(func() tea.Msg {
-		result, err := registry.Call(ctx, callCopy.Name, callCopy.Args)
-		cancel() // release cancel func even on the success path
-		if err != nil {
-			return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
-		}
-		return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: result}
-	}, m.spinner.Tick)
 }
 
 // refreshViewport re-renders all output lines into the viewport and scrolls
@@ -2677,32 +1366,6 @@ func (m *Model) refreshViewportKeepPosition() {
 	m.viewport.SetYOffset(prevOffset)
 }
 
-// refreshViewportStreaming appends the current streaming buffer as a preview.
-func (m *Model) refreshViewportStreaming() {
-	preview := strings.TrimRight(m.streamBuffer, "\n")
-	reasoning := strings.TrimRight(m.reasoningBuffer, "\n")
-
-	lines := m.outputLines
-	// Replace the last line (the "…" spinner placeholder) with live text.
-	if len(lines) > 0 && strings.Contains(lines[len(lines)-1], "…") {
-		lines = lines[:len(lines)-1]
-	}
-
-	label := assistantLabelStyle.Render("aig")
-	content := strings.Join(lines, "\n\n") + "\n\n" + label
-
-	if reasoning != "" {
-		content += "\n" + thinkingStyle.Render(reasoning)
-	}
-
-	if preview != "" {
-		content += "\n\n" + preview
-	}
-
-	m.viewport.SetContent(content)
-	m.viewport.GotoBottom()
-}
-
 // appendOutput adds a rendered line to the output history.
 func (m *Model) appendOutput(line string) {
 	m.outputLines = append(m.outputLines, line)
@@ -2720,8 +1383,6 @@ func (m Model) statusBar() string {
 		}
 	case stateConfirmingCmd:
 		statusText = "⚠ awaiting confirmation"
-	case stateExecuting:
-		statusText = "⛔ executing command"
 	case stateExecutingTool:
 		statusText = "⚙ executing tool"
 	case stateConfirmingWrite:
@@ -2765,7 +1426,7 @@ func (m Model) statusBar() string {
 
 	// Auto-approve badge
 	autoTag := ""
-	if m.autoApproveCommands {
+	if m.agent.AutoApprove() {
 		autoTag = lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("⚡auto")
 	}
 
@@ -2808,7 +1469,7 @@ func helpOverlay() string {
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  Shortcuts"),
 		"  Enter           Send message",
 		"  Shift+Enter     Insert newline",
-		"  Ctrl+C          Cancel stream / kill command / quit",
+		"  Ctrl+C          Cancel the running turn / quit",
 		"  Ctrl+L          Clear viewport",
 		"  ?               Toggle this help",
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  Session Commands"),
@@ -2834,78 +1495,4 @@ func helpOverlay() string {
 		"  /read(path)     Attach file content to next message",
 	}
 	return strings.Join(lines, "\n")
-}
-
-// hashArguments returns a SHA-256 hash string for the tool arguments, ensuring
-// deterministic output by letting encoding/json sort map keys automatically.
-func hashArguments(args map[string]any) string {
-	if len(args) == 0 {
-		return ""
-	}
-	b, err := json.Marshal(args)
-	if err != nil {
-		return ""
-	}
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
-}
-
-// SplitReasoning splits the accumulated raw text stream into standard content
-// and reasoning blocks by scanning for <think>…</think> (or <thought>…</thought>)
-// tags. It returns the cleaned final response text, the aggregated reasoning
-// block, and a boolean indicating if the stream is currently inside an open,
-// unclosed thinking block.
-func SplitReasoning(input string) (string, string, bool) {
-	var sbContent, sbReasoning strings.Builder
-	rest := input
-	for {
-		openIdx, openTag, closeTag := findThinkOpen(rest)
-		if openIdx == -1 {
-			sbContent.WriteString(rest)
-			return sbContent.String(), sbReasoning.String(), false
-		}
-		sbContent.WriteString(rest[:openIdx])
-		rest = rest[openIdx+len(openTag):]
-
-		endIdx := strings.Index(rest, closeTag)
-		if endIdx == -1 {
-			sbReasoning.WriteString(rest)
-			return sbContent.String(), sbReasoning.String(), true
-		}
-		sbReasoning.WriteString(rest[:endIdx])
-		rest = rest[endIdx+len(closeTag):]
-	}
-}
-
-// findThinkOpen returns the index of the earliest supported reasoning open tag
-// in s, along with that tag and its matching close tag.
-func findThinkOpen(s string) (int, string, string) {
-	best, open, closeTag := -1, "", ""
-	for _, pair := range [][2]string{{"<think>", "</think>"}, {"<thought>", "</thought>"}} {
-		if i := strings.Index(s, pair[0]); i != -1 && (best == -1 || i < best) {
-			best, open, closeTag = i, pair[0], pair[1]
-		}
-	}
-	return best, open, closeTag
-}
-
-// SetContextBlock sets the environment/instructions block appended to the
-// system prompt of every request.
-func (m *Model) SetContextBlock(block string) {
-	m.contextBlock = strings.TrimSpace(block)
-}
-
-// withContextBlock returns a copy of history whose first system message has
-// block appended (or a new leading system message if there is none).
-func withContextBlock(history []llm.Message, block string) []llm.Message {
-	if block == "" {
-		return history
-	}
-	out := make([]llm.Message, len(history))
-	copy(out, history)
-	if len(out) > 0 && out[0].Role == llm.RoleSystem {
-		out[0].Content = strings.TrimSpace(out[0].Content) + "\n\n" + block
-		return out
-	}
-	return append([]llm.Message{{Role: llm.RoleSystem, Content: block}}, out...)
 }

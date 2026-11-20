@@ -2,22 +2,21 @@
 
 > A cross-platform, terminal-based AI agent written in Go.
 
-````
+```
   ✦ aig — Sagittarius A*
   terminal AI agent  ·  type /help for commands
   ──────────────────────────────────────────────
   You
-  what files are in this directory?
+  why does `make test` fail?
 
   aig
-  I'll list the files for you.
-  ```bash
-  ls -la
-````
-
-[Execute this bash block? (y/N)]
-
-````
+  ⚡ run_command: make test
+  ✓ Tool run_command done
+  ⚙ Tool: read_file
+  ✏️  edit_file: internal/config/config.go
+  Diff preview: …
+  💾 Write to internal/config/config.go? (y/Esc)
+```
 
 ---
 
@@ -218,75 +217,41 @@ aig -r 20260521-170000
 ## Architecture
 
 ```
-cmd/aig/
-└── main.go              Cobra CLI entry point
-
-internal/
-├── config/
-│   └── config.go        Env-based config loading & validation
-├── llm/
-│   ├── provider.go      Provider interface + Message type
-│   ├── gemini.go        google.golang.org/genai streaming
-│   └── deepseek.go      sashabaranov/go-openai + DeepSeek BaseURL
-├── mcp/
-│   ├── manager.go       Subprocess lifecycle manager
-│   ├── client.go        JSON-RPC 2.0 stdio client
-│   └── registry.go      Tool discovery & routing registry
-├── tui/
-│   ├── model.go         Bubble Tea state machine (4 states)
-│   ├── messages.go      Custom tea.Msg types
-│   └── styles.go        Lipgloss style definitions
-└── sandbox/
-    └── executor.go      OS-aware command execution
+cmd/aig            CLI entry: config, MCP bootstrap, context block, agent + TUI wiring
+internal/agent     the agent loop (UI-independent) → event stream + approval requests
+internal/tools     native tools, edit matching, post-edit checks, risk levels
+internal/tui       Bubble Tea front-end: renders events, answers approvals
+internal/llm       providers (Gemini, OpenAI-compatible DeepSeek / NVIDIA NIM), pruning, <think> splitting
+internal/prompt    environment block + AGENTS.md / CLAUDE.md instructions
+internal/sandbox   command execution (process groups, output caps, askpass sudo)
+internal/mcp       MCP host (stdio servers, namespaced tools)
+internal/config    config file, personas, provider endpoints, prompt trust store
+internal/session   JSON session persistence
 ```
 
-### State Machine
+### Turn lifecycle
 
 ```
-            ┌───────────────────────────────────────────────┐
-            ▼                                               │
- ┌─────────────────────┐                                    │
- │     stateInput      │                                    │
- └──────────┬──────────┘                                    │
-            │ [submit]                                      │
-            ▼                                               │
- ┌─────────────────────┐                                    │
- │   stateStreaming    ├──────────────[done / no tools]─────┤
- └──────────┬──────────┘                                    │
-            │                                               │
-      [tool calls]                                          │
-            │                                               │
-            ▼                                               │
- ┌─────────────────────┐                                    │
- │ stateExecutingTools │                                    │
- └──────────┬──────────┘                                    │
-            │                                               │
-            ├───────────────► [Read/Search Tool]            │
-            │                 Executes immediately          │
-            │                                               │
-            ├───────────────► [File Mutation Tool]          │
-            │                 └─► stateConfirmingWrite ──┐  │
-            │                     ├─► [y] ──► Commit ────┤  │
-            │                     └─► [n] ──► Skip ──────┤  │
-            │                                            │  │
-            └───────────────► [run_command Tool]         │  │
-                              ├─► Auto-approve ──────────┼──┤
-                              └─► Confirm Gate ──────────┘  │
-                                  └─► stateConfirmingCmd    │
-                                      ├─► [y]               │
-                                      │   └─► stateExecuting│
-                                      │       └─► Execute ──┤
-                                      └─► [n] ──► Skip ─────┘
+user message
+   │
+   ▼
+agent.Run(ctx, history) ──► StreamStartEvent, TokenEvent… ──► TUI live preview (≈30 fps)
+   │
+   ├─ no tool calls ──► MessageEvent(assistant) ──► DoneEvent
+   │
+   └─ tool calls ──► for each call:
+                       policy: read in workspace → run
+                               write → ApprovalEvent (diff)        ─┐
+                               run_command / MCP / web_fetch /      │ TUI answers:
+                               outside workspace → ApprovalEvent   ─┘ Approve / Deny
+                       ToolStartEvent → execute → ToolResultEvent + MessageEvent(tool)
+                     loop breakers (3 identical calls / 3 errors) answer the rest and re-plan
+                     ──► stream again (up to 50 rounds)
+
+Ctrl+C at any point cancels ctx: remaining calls are answered "aborted", DoneEvent{Aborted}.
 ```
 
-### Streaming Architecture
-
-The TUI uses the **`waitForToken` relay pattern**:
-
-1. On submit, a background goroutine calls `provider.StreamChat()` and writes tokens into a buffered channel.
-2. `waitForToken(ch)` is a `tea.Cmd` that blocks on `<-ch` and returns one `tokenMsg`.
-3. On receiving `tokenMsg`, `Update` appends the token and re-issues `waitForToken(ch)` — creating a continuous, non-blocking loop.
-4. When the channel is closed, `waitForToken` returns `nil` (no-op), and `streamDoneMsg` triggers the final glamour render.
+The TUI mirrors the conversation by appending every `MessageEvent` to its history and saving the session. The agent never touches the UI, so it can also drive a headless mode or subagents. The tests drive both layers with a fake provider.
 
 ---
 

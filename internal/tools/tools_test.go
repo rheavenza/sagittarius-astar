@@ -1,4 +1,4 @@
-package tui
+package tools
 
 import (
 	"errors"
@@ -10,17 +10,6 @@ import (
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 )
-
-func TestSplitReasoningBothTags(t *testing.T) {
-	content, reasoning, open := SplitReasoning("a<think>r1</think>b<thought>r2</thought>c")
-	if content != "abc" || reasoning != "r1r2" || open {
-		t.Fatalf("got content=%q reasoning=%q open=%v", content, reasoning, open)
-	}
-	content, reasoning, open = SplitReasoning("x<thought>partial")
-	if content != "x" || reasoning != "partial" || !open {
-		t.Fatalf("unclosed block: content=%q reasoning=%q open=%v", content, reasoning, open)
-	}
-}
 
 func TestSimpleDiff(t *testing.T) {
 	d := simpleDiff("a\nb\nc", "a\nB\nc")
@@ -34,7 +23,7 @@ func TestSimpleDiff(t *testing.T) {
 
 func TestTruncateUTF8(t *testing.T) {
 	s := "héllo" // é is 2 bytes at index 1-2
-	got := truncateUTF8(s, 2)
+	got := TruncateUTF8(s, 2)
 	if !utf8.ValidString(got) || got != "h" {
 		t.Fatalf("got %q", got)
 	}
@@ -45,7 +34,7 @@ func TestCommitWriteRejectsStaleProposal(t *testing.T) {
 	if err := os.WriteFile(path, []byte("one\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, pw, _ := ExecuteToolWithWrite(llm.ToolCall{Name: "edit_file", Args: map[string]any{
+	_, pw, _ := Execute(llm.ToolCall{Name: "edit_file", Args: map[string]any{
 		"path": path, "old_content": "one", "new_content": "two",
 	}})
 	if pw == nil {
@@ -61,7 +50,7 @@ func TestCommitWriteRejectsStaleProposal(t *testing.T) {
 	}
 
 	// A fresh proposal commits fine.
-	_, pw, _ = ExecuteToolWithWrite(llm.ToolCall{Name: "write_file", Args: map[string]any{
+	_, pw, _ = Execute(llm.ToolCall{Name: "write_file", Args: map[string]any{
 		"path": path, "content": "fresh",
 	}})
 	if err := CommitWrite(*pw); err != nil {
@@ -89,18 +78,10 @@ func TestNativeToolNeedsApproval(t *testing.T) {
 	}
 	t.Chdir(root)
 	for _, c := range cases {
-		got, _ := NativeToolNeedsApproval(c.call, root)
+		got, _ := NeedsApproval(c.call, root)
 		if got != c.want {
 			t.Errorf("%s %v: got %v want %v", c.call.Name, c.call.Args, got, c.want)
 		}
-	}
-}
-
-func TestSkippedToolResultsAnswerEveryCall(t *testing.T) {
-	calls := []llm.ToolCall{{ID: "a", Name: "x"}, {ID: "b", Name: "y"}}
-	got := skippedToolResults(calls, "skipped")
-	if len(got) != 2 || got[1].ToolCallID != "b" || got[1].Role != llm.RoleTool {
-		t.Fatalf("unexpected results: %+v", got)
 	}
 }
 
@@ -120,7 +101,7 @@ func TestSearchRegexSkipsIgnoredDirsAndBinaries(t *testing.T) {
 	must("node_modules/pkg/index.js", "needle in deps")
 	must("bin/blob", "needle\x00binary")
 
-	out, _, err := ExecuteToolWithWrite(llm.ToolCall{Name: "search_regex", Args: map[string]any{"pattern": "needle", "dir": root}})
+	out, _, err := Execute(llm.ToolCall{Name: "search_regex", Args: map[string]any{"pattern": "needle", "dir": root}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,20 +115,10 @@ func TestSearchRegexSkipsIgnoredDirsAndBinaries(t *testing.T) {
 	}
 }
 
-func TestBuildModelItems(t *testing.T) {
-	known := [][2]string{{"meta/llama-3.3-70b-instruct", "Llama 3.3 70B"}}
-	live := []string{"meta/llama-3.3-70b-instruct", "moonshotai/kimi-k3", "google/gemma-4-31b-it"}
-
-	all := buildModelItems(known, live, "", "moonshotai/kimi-k3")
-	if len(all) != 3 || all[0].ID != "meta/llama-3.3-70b-instruct" {
-		t.Fatalf("expected known first and deduplicated: %+v", all)
-	}
-	if !strings.Contains(all[1].Label, "(active)") {
-		t.Errorf("active model not marked: %+v", all[1])
-	}
-
-	filtered := buildModelItems(known, live, "GEMMA", "")
-	if len(filtered) != 1 || filtered[0].ID != "google/gemma-4-31b-it" {
-		t.Fatalf("filter failed: %+v", filtered)
+func TestEveryDefinitionHasARisk(t *testing.T) {
+	for _, d := range Definitions() {
+		if _, ok := RiskOf(d.Name); !ok {
+			t.Errorf("tool %q has no risk classification", d.Name)
+		}
 	}
 }

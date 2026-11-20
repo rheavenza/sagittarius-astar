@@ -24,6 +24,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 
+	"github.com/clitorhea/sagittarius-astar.git/internal/agent"
 	"github.com/clitorhea/sagittarius-astar.git/internal/config"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
@@ -245,12 +246,21 @@ func runChat(_ *cobra.Command, _ []string) error {
 	}
 
 	// ── TUI ─────────────────────────────────────────────────────────────────────────────────
-	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt, version, string(cfg.Provider), cfg.Model, cfg.Persona, mcpRegistry)
+	// ── Agent ───────────────────────────────────────────────────────────────────────────────
+	cwd, _ := os.Getwd()
+	ag := agent.New(agent.Options{
+		Provider:       provider,
+		MCP:            mcpRegistry,
+		WorkspaceRoot:  cwd,
+		ContextBlock:   buildContextBlock(),
+		PostEditChecks: fc.PostEditChecks,
+	})
+
+	model, err := tui.NewModel(ag, activeSession, cfg.SystemPrompt, version, string(cfg.Provider), cfg.Model, cfg.Persona)
 	if err != nil {
 		logger.L.Error("TUI init failed", "error", err)
 		return fmt.Errorf("failed to initialize TUI: %w", err)
 	}
-	model.SetContextBlock(buildContextBlock())
 
 	p := tea.NewProgram(
 		model,

@@ -1,4 +1,4 @@
-package tui
+package tools
 
 import (
 	"context"
@@ -86,7 +86,7 @@ func runCheck(ctx context.Context, dir, label, name string, args ...string) stri
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if len(text) > maxCheckOutput {
-		text = truncateUTF8(text, maxCheckOutput) + "\n…(truncated)"
+		text = TruncateUTF8(text, maxCheckOutput) + "\n…(truncated)"
 	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Sprintf("Post-edit check (%s) timed out after %s", label, postEditCheckTimeout)
