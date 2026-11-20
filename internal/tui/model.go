@@ -57,6 +57,7 @@ const (
 	stateSelecting                      // Selecting options (models, history, providers, personas)
 	stateInputSudoPassword              // Awaiting user input for sudo password.
 	stateRuntimeInput                   // Sending a stdin line to an already-running process.
+	stateConfirmingTool                 // Awaiting y/n for an MCP / web_fetch / out-of-workspace tool call.
 )
 
 // execLangs are the code fence tags that trigger the sandbox prompt.
@@ -87,9 +88,9 @@ type Model struct {
 	loopErrorCount       int
 	toolTelemetry        []ToolTelemetry
 	// Real-time reasoning buffers
-	rawStreamBuffer      string
-	nativeReasoningBuf   string
-	isDeliberating       bool
+	rawStreamBuffer    string
+	nativeReasoningBuf string
+	isDeliberating     bool
 	// Core state
 	appState state
 	history  []llm.Message // full conversation history
@@ -111,10 +112,10 @@ type Model struct {
 	activePersona  string
 
 	// Core dependencies
-	fileConfig    *config.FileConfig // parsed config, for persona resolution
+	fileConfig *config.FileConfig // parsed config, for persona resolution
 	// mcpRegistry holds the live MCP tool registry. Nil when no MCP servers are
 	// configured — all existing code paths remain unaffected in that case.
-	mcpRegistry   *mcp.Registry
+	mcpRegistry *mcp.Registry
 
 	// autoApproveCommands skips the confirmation dialog for run_command tool calls.
 	autoApproveCommands bool
@@ -127,7 +128,7 @@ type Model struct {
 	tokenChan       chan string
 	streamBuffer    string // accumulates tokens during streaming
 	reasoningBuffer string // accumulates DeepSeek reasoning_content tokens (not displayed)
-	cancelStream   context.CancelFunc
+	cancelStream    context.CancelFunc
 
 	// Pending command execution
 	pendingCmd  string
@@ -144,17 +145,34 @@ type Model struct {
 	runtimeInput textinput.Model
 
 	// Pending write_file confirmation
-	pendingWrite *PendingWrite
+	pendingWrite       *PendingWrite
 	pendingWriteCallID string
+	pendingWriteName   string
+
+	// pendingConfirmCall is the tool call awaiting approval in stateConfirmingTool.
+	pendingConfirmCall *llm.ToolCall
+
+	// toolAbortRequested is set by Ctrl+C while a tool runs. The in-flight
+	// tool's own result still arrives (exactly once); the remaining calls in
+	// the batch are then marked aborted and control returns to the user.
+	toolAbortRequested bool
+
+	// workspaceRoot is the directory aig was started in; read-only tools may
+	// access it freely, anything outside requires approval.
+	workspaceRoot string
+
+	// providerFingerprint is provider|model|apiKey of the live m.provider, so
+	// the client is only rebuilt when one of those actually changes.
+	providerFingerprint string
 
 	// UI components
-	textarea      textarea.Model
-	cmdTextarea   textarea.Model
-	sudoTextInput textinput.Model
-	viewport      viewport.Model
-	spinner       spinner.Model
-	progressBar   progress.Model
-	execStart     time.Time
+	textarea           textarea.Model
+	cmdTextarea        textarea.Model
+	sudoTextInput      textinput.Model
+	viewport           viewport.Model
+	spinner            spinner.Model
+	progressBar        progress.Model
+	execStart          time.Time
 	execTimeout        time.Duration
 	sudoPassword       string
 	autocompletePrefix string
@@ -231,7 +249,11 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 	ri.Placeholder = "Type input for the running process and press Enter to send..."
 	ri.CharLimit = 1024
 
+	workspaceRoot, _ := os.Getwd()
+
 	m := &Model{
+		workspaceRoot:       workspaceRoot,
+		providerFingerprint: providerName + "|" + modelName + "|" + config.GetAPIKey(config.ProviderName(providerName)),
 		appState:            stateInput,
 		history:             activeSession.History,
 		provider:            provider,
@@ -389,7 +411,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						m.appendOutput("  /provider <name>   Switch active provider (keeps history)")
 						m.appendOutput("  /persona           List available personas")
 						m.appendOutput("  /persona <name>    Switch system prompt persona")
-						m.appendOutput("  /approve-tools on  Auto-execute agent run_command calls")
+						m.appendOutput("  /approve-tools on  Auto-run commands, MCP tools, web_fetch and out-of-workspace reads")
 						m.appendOutput("  /approve-tools off Require confirmation per command (default)")
 						m.appendOutput("  /quit, /q          Exit the application")
 						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Keyboard shortcuts:"))
@@ -576,187 +598,187 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						break
 					}
 
-				// ── /model [name] ──────────────────────────────────────────
-				if strings.HasPrefix(input, "/model") {
-					arg := strings.TrimSpace(strings.TrimPrefix(input, "/model"))
+					// ── /model [name] ──────────────────────────────────────────
+					if strings.HasPrefix(input, "/model") {
+						arg := strings.TrimSpace(strings.TrimPrefix(input, "/model"))
 
-					if arg == "" {
-						prov := config.ProviderName(m.activeProvider)
-						models, ok := config.KnownModels[prov]
-						if !ok || len(models) == 0 {
-							m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("  (no known models for this provider)"))
+						if arg == "" {
+							prov := config.ProviderName(m.activeProvider)
+							models, ok := config.KnownModels[prov]
+							if !ok || len(models) == 0 {
+								m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("  (no known models for this provider)"))
+								m.refreshViewport()
+								break
+							}
+							m.selectionItems = nil
+							m.selectionIdx = 0
+							m.selectionType = "model"
+							for _, pair := range models {
+								label := fmt.Sprintf("%s (%s)", pair[1], pair[0])
+								if pair[0] == m.activeModel {
+									label += " (active)"
+								}
+								m.selectionItems = append(m.selectionItems, selectionItem{
+									ID:    pair[0],
+									Label: label,
+								})
+							}
+							m.appState = stateSelecting
+							m.textarea.Blur()
+							break
+						}
+
+						// Switch to the named model (keep provider, keep history)
+						apiKey := config.GetAPIKey(config.ProviderName(m.activeProvider))
+						if apiKey == "" {
+							m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ No API key stored for provider %q", m.activeProvider)))
 							m.refreshViewport()
 							break
 						}
-						m.selectionItems = nil
-						m.selectionIdx = 0
-						m.selectionType = "model"
-						for _, pair := range models {
-							label := fmt.Sprintf("%s (%s)", pair[1], pair[0])
-							if pair[0] == m.activeModel {
-								label += " (active)"
+						newProvider, err := llm.NewProvider(m.activeProvider, apiKey, arg)
+						if err != nil {
+							m.appendOutput(errorStyle.Render("✗ Failed to switch model: " + err.Error()))
+						} else {
+							m.provider = newProvider
+							m.activeModel = arg
+							if m.activeSession != nil {
+								m.activeSession.Model = arg
+								m.saveSession()
 							}
-							m.selectionItems = append(m.selectionItems, selectionItem{
-								ID:    pair[0],
-								Label: label,
-							})
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
+								fmt.Sprintf("✓ Switched to model: %s", arg)))
 						}
-						m.appState = stateSelecting
-						m.textarea.Blur()
-						break
-					}
-
-					// Switch to the named model (keep provider, keep history)
-					apiKey := config.GetAPIKey(config.ProviderName(m.activeProvider))
-					if apiKey == "" {
-						m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ No API key stored for provider %q", m.activeProvider)))
-						m.refreshViewport()
-						break
-					}
-					newProvider, err := llm.NewProvider(m.activeProvider, apiKey, arg)
-					if err != nil {
-						m.appendOutput(errorStyle.Render("✗ Failed to switch model: " + err.Error()))
-					} else {
-						m.provider = newProvider
-						m.activeModel = arg
-						if m.activeSession != nil {
-							m.activeSession.Model = arg
-							m.saveSession()
-						}
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
-							fmt.Sprintf("✓ Switched to model: %s", arg)))
-					}
-					m.refreshViewport()
-					break
-				}
-
-				// ── /provider [name] ───────────────────────────────────────
-				if strings.HasPrefix(input, "/provider") {
-					arg := strings.TrimSpace(strings.TrimPrefix(input, "/provider"))
-
-					if arg == "" {
-						providers := []string{"gemini", "deepseek"}
-						m.selectionItems = nil
-						m.selectionIdx = 0
-						m.selectionType = "provider"
-						for _, p := range providers {
-							label := p
-							if p == m.activeProvider {
-								label += " (active)"
-							}
-							m.selectionItems = append(m.selectionItems, selectionItem{
-								ID:    p,
-								Label: label,
-							})
-						}
-						m.appState = stateSelecting
-						m.textarea.Blur()
-						break
-					}
-
-					arg = strings.ToLower(arg)
-					apiKey := config.GetAPIKey(config.ProviderName(arg))
-					if apiKey == "" {
-						m.appendOutput(errorStyle.Render(fmt.Sprintf(
-							"✗ No API key configured for %q. Set it in ~/.config/aig/config.json or via environment variable.", arg)))
-						m.refreshViewport()
-						break
-					}
-					defaultModel := string(config.DefaultModel(config.ProviderName(arg)))
-					newProvider, err := llm.NewProvider(arg, apiKey, defaultModel)
-					if err != nil {
-						m.appendOutput(errorStyle.Render("✗ Failed to switch provider: " + err.Error()))
-					} else {
-						m.provider = newProvider
-						m.activeProvider = arg
-						m.activeModel = defaultModel
-						if m.activeSession != nil {
-							m.activeSession.Provider = arg
-							m.activeSession.Model = defaultModel
-							m.saveSession()
-						}
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
-							fmt.Sprintf("✓ Switched to provider: %s  model: %s", arg, defaultModel)))
-					}
-					m.refreshViewport()
-					break
-				}
-
-				// ── /persona [name] ────────────────────────────────────────
-				if strings.HasPrefix(input, "/persona") {
-					arg := strings.TrimSpace(strings.TrimPrefix(input, "/persona"))
-
-					if arg == "" {
-						names := config.PersonaList(m.fileConfig)
-						m.selectionItems = nil
-						m.selectionIdx = 0
-						m.selectionType = "persona"
-						for _, name := range names {
-							label := name
-							if name == m.activePersona {
-								label += " (active)"
-							}
-							m.selectionItems = append(m.selectionItems, selectionItem{
-								ID:    name,
-								Label: label,
-							})
-						}
-						m.appState = stateSelecting
-						m.textarea.Blur()
-						break
-					}
-
-					prompt, ok := config.ResolvePersona(arg, m.fileConfig)
-					if !ok {
-						m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ Unknown persona %q. Type /persona to list available.", arg)))
 						m.refreshViewport()
 						break
 					}
 
-					m.defaultSystemPrompt = prompt
-					m.activePersona = arg
-					// Replace or prepend the leading system message in history
-					if len(m.history) > 0 && m.history[0].Role == llm.RoleSystem {
-						m.history[0].Content = prompt
-					} else {
-						m.history = append([]llm.Message{{Role: llm.RoleSystem, Content: prompt}}, m.history...)
-					}
-					m.saveSession()
-					m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
-						fmt.Sprintf("✓ Persona switched to %q (effective next message)", arg)))
-					m.refreshViewport()
-					break
-				}
+					// ── /provider [name] ───────────────────────────────────────
+					if strings.HasPrefix(input, "/provider") {
+						arg := strings.TrimSpace(strings.TrimPrefix(input, "/provider"))
 
-				// ── /approve-tools on|off ──────────────────────────────────────
-				if strings.HasPrefix(input, "/approve-tools") {
-					arg := strings.TrimSpace(strings.TrimPrefix(input, "/approve-tools"))
-					switch arg {
-					case "on", "1", "yes":
-						m.autoApproveCommands = true
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
-							"⚡ Auto-approve enabled — run_command will execute without prompting."))
-					case "off", "0", "no":
-						m.autoApproveCommands = false
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
-							"✓ Auto-approve disabled — commands require confirmation."))
-					default:
-						status := "off"
-						if m.autoApproveCommands {
-							status = "on"
+						if arg == "" {
+							providers := []string{"gemini", "deepseek"}
+							m.selectionItems = nil
+							m.selectionIdx = 0
+							m.selectionType = "provider"
+							for _, p := range providers {
+								label := p
+								if p == m.activeProvider {
+									label += " (active)"
+								}
+								m.selectionItems = append(m.selectionItems, selectionItem{
+									ID:    p,
+									Label: label,
+								})
+							}
+							m.appState = stateSelecting
+							m.textarea.Blur()
+							break
 						}
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(
-							fmt.Sprintf("Auto-approve is currently: %s. Use /approve-tools on|off", status)))
+
+						arg = strings.ToLower(arg)
+						apiKey := config.GetAPIKey(config.ProviderName(arg))
+						if apiKey == "" {
+							m.appendOutput(errorStyle.Render(fmt.Sprintf(
+								"✗ No API key configured for %q. Set it in ~/.config/aig/config.json or via environment variable.", arg)))
+							m.refreshViewport()
+							break
+						}
+						defaultModel := string(config.DefaultModel(config.ProviderName(arg)))
+						newProvider, err := llm.NewProvider(arg, apiKey, defaultModel)
+						if err != nil {
+							m.appendOutput(errorStyle.Render("✗ Failed to switch provider: " + err.Error()))
+						} else {
+							m.provider = newProvider
+							m.activeProvider = arg
+							m.activeModel = defaultModel
+							if m.activeSession != nil {
+								m.activeSession.Provider = arg
+								m.activeSession.Model = defaultModel
+								m.saveSession()
+							}
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
+								fmt.Sprintf("✓ Switched to provider: %s  model: %s", arg, defaultModel)))
+						}
+						m.refreshViewport()
+						break
 					}
+
+					// ── /persona [name] ────────────────────────────────────────
+					if strings.HasPrefix(input, "/persona") {
+						arg := strings.TrimSpace(strings.TrimPrefix(input, "/persona"))
+
+						if arg == "" {
+							names := config.PersonaList(m.fileConfig)
+							m.selectionItems = nil
+							m.selectionIdx = 0
+							m.selectionType = "persona"
+							for _, name := range names {
+								label := name
+								if name == m.activePersona {
+									label += " (active)"
+								}
+								m.selectionItems = append(m.selectionItems, selectionItem{
+									ID:    name,
+									Label: label,
+								})
+							}
+							m.appState = stateSelecting
+							m.textarea.Blur()
+							break
+						}
+
+						prompt, ok := config.ResolvePersona(arg, m.fileConfig)
+						if !ok {
+							m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ Unknown persona %q. Type /persona to list available.", arg)))
+							m.refreshViewport()
+							break
+						}
+
+						m.defaultSystemPrompt = prompt
+						m.activePersona = arg
+						// Replace or prepend the leading system message in history
+						if len(m.history) > 0 && m.history[0].Role == llm.RoleSystem {
+							m.history[0].Content = prompt
+						} else {
+							m.history = append([]llm.Message{{Role: llm.RoleSystem, Content: prompt}}, m.history...)
+						}
+						m.saveSession()
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
+							fmt.Sprintf("✓ Persona switched to %q (effective next message)", arg)))
+						m.refreshViewport()
+						break
+					}
+
+					// ── /approve-tools on|off ──────────────────────────────────────
+					if strings.HasPrefix(input, "/approve-tools") {
+						arg := strings.TrimSpace(strings.TrimPrefix(input, "/approve-tools"))
+						switch arg {
+						case "on", "1", "yes":
+							m.autoApproveCommands = true
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
+								"⚡ Auto-approve enabled — commands, MCP tools, web_fetch and out-of-workspace reads run without prompting."))
+						case "off", "0", "no":
+							m.autoApproveCommands = false
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
+								"✓ Auto-approve disabled — commands and sensitive tools require confirmation."))
+						default:
+							status := "off"
+							if m.autoApproveCommands {
+								status = "on"
+							}
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(
+								fmt.Sprintf("Auto-approve is currently: %s. Use /approve-tools on|off", status)))
+						}
+						m.refreshViewport()
+						break
+					}
+
+					// Unknown command fallback
+					m.appendOutput(errorStyle.Render("✗ Unknown command. Type /help to see available commands."))
 					m.refreshViewport()
 					break
 				}
-
-				// Unknown command fallback
-				m.appendOutput(errorStyle.Render("✗ Unknown command. Type /help to see available commands."))
-				m.refreshViewport()
-				break
-			}
 
 				// Standard user prompt submission
 				m.textarea.Reset()
@@ -874,47 +896,29 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 				m.textarea.Focus()
 				m.appendOutput(confirmStyle.Render("✗ Command cancelled (sudo password required)."))
 				m.refreshViewport()
+				if m.pendingLang == "" && m.pendingToolIdx < len(m.pendingToolCalls) {
+					// Tool-call path: the call still needs a result, or the next
+					// request is rejected for an unanswered tool_call.
+					call := m.pendingToolCalls[m.pendingToolIdx]
+					return m, func() tea.Msg {
+						return toolCallResultMsg{CallID: call.ID, Name: call.Name,
+							Result: "Command cancelled by user (sudo password not provided)."}
+					}
+				}
 				return m, nil
 			case tea.KeyEnter:
 				passwd := m.sudoTextInput.Value()
 				m.sudoPassword = passwd
 				m.sudoTextInput.Reset()
 				m.sudoTextInput.Blur()
-				
+
 				// Now resume command execution
 				cmd := m.pendingCmd
 				if m.pendingLang == "" && len(m.pendingToolCalls) > 0 {
 					// Tool call path
 					call := m.pendingToolCalls[m.pendingToolIdx]
-					m.appState = stateExecutingTool
-					m.execStart = time.Now()
-					m.execTimeout = sandbox.DefaultTimeout
-					if v, ok := call.Args["timeout_seconds"].(float64); ok && v > 0 {
-						m.execTimeout = time.Duration(v) * time.Second
-					}
 					m.appendOutput(confirmStyle.Render("⚡ Executing…"))
-					m.refreshViewport()
-					
-					// Patch the command
-					callCopy := call
-					callCopy.Args["command"] = cmd
-					ctx, cancel := context.WithCancel(context.Background())
-					m.cancelExec = cancel
-					pipeR, pipeW := io.Pipe()
-					m.stdinPipe = pipeW
-					// Pre-seed sudo password if needed.
-					if m.sudoPassword != "" {
-						_, _ = fmt.Fprintln(pipeW, m.sudoPassword)
-					}
-					return m, tea.Batch(func() tea.Msg {
-						out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword, pipeR)
-						cancel()
-						_ = pipeR.Close()
-						if err != nil {
-							return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
-						}
-						return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: out}
-					}, m.spinner.Tick)
+					return m, m.startRunCommand(call, cmd)
 				} else {
 					// Code block sandbox path
 					m.appState = stateExecuting
@@ -925,7 +929,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 					return m, tea.Batch(m.runSandboxCmd(), m.spinner.Tick)
 				}
 			}
-			
+
 			var tiCmd tea.Cmd
 			m.sudoTextInput, tiCmd = m.sudoTextInput.Update(msg)
 			return m, tiCmd
@@ -964,7 +968,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 				// so the batch loop can continue with the next tool.
 				if m.pendingLang == "" && len(m.pendingToolCalls) > 0 {
 					call := m.pendingToolCalls[m.pendingToolIdx]
-				m.appState = stateInput
+					m.appState = stateInput
 					m.cmdTextarea.Blur()
 					m.textarea.Focus()
 					m.appendOutput(confirmStyle.Render("✗ Command skipped."))
@@ -999,34 +1003,10 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						m.refreshViewport()
 						return m, nil
 					}
-					m.appState = stateExecutingTool
-					m.execStart = time.Now()
-					m.execTimeout = sandbox.DefaultTimeout
-					if v, ok := call.Args["timeout_seconds"].(float64); ok && v > 0 {
-						m.execTimeout = time.Duration(v) * time.Second
-					}
 					m.cmdTextarea.Blur()
 					m.appendOutput(confirmStyle.Render("⚡ Executing…"))
-					m.refreshViewport()
-					// Patch the command in case the user edited it.
-					callCopy := call
-					callCopy.Args["command"] = cmd
-					ctx, cancel := context.WithCancel(context.Background())
-					m.cancelExec = cancel
-					pipeR, pipeW := io.Pipe()
-					m.stdinPipe = pipeW
-					if m.sudoPassword != "" {
-						_, _ = fmt.Fprintln(pipeW, m.sudoPassword)
-					}
-					return m, tea.Batch(func() tea.Msg {
-						out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword, pipeR)
-						cancel()
-						_ = pipeR.Close()
-						if err != nil {
-							return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
-						}
-						return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: out}
-					}, m.spinner.Tick)
+					// The user may have edited the command.
+					return m, m.startRunCommand(call, cmd)
 				}
 				// Code-fence sandbox path.
 				logger.L.Info("sandbox: user approved execution",
@@ -1086,36 +1066,25 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 					return m, nil
 				}
 			}
-			// Ctrl+C aborts the tool and sends an error result to unblock the chain.
+			// Ctrl+C cancels the running tool. Its goroutine still delivers
+			// exactly one toolCallResultMsg (cancellation propagates via ctx);
+			// the result handler then marks the rest of the batch as aborted
+			// and returns to input. (Previously this handler advanced
+			// pendingToolIdx itself, which skipped the next tool and produced
+			// a duplicate result.)
 			if msg.Type == tea.KeyCtrlC {
-				m.killExec()
-				logger.L.Warn("tool: execution killed by user")
-				m.appendOutput(errorStyle.Render("✗ Tool aborted."))
-				m.refreshViewport()
-				// Send an error result so the pending-tool chain moves on (or the
-				// LLM gets an error response instead of hanging forever).
-				if len(m.pendingToolCalls) > 0 && m.pendingToolIdx < len(m.pendingToolCalls) {
-					call := m.pendingToolCalls[m.pendingToolIdx]
-					m.pendingToolIdx++
-					if m.pendingToolIdx < len(m.pendingToolCalls) {
-						// More tools remain — send error result and continue chain.
-						return m, func() tea.Msg {
-							return toolCallResultMsg{CallID: call.ID, Name: call.Name, Error: fmt.Errorf("aborted by user")}
-						}
-					}
-					// Last tool — send error result and reset to input.
-					m.pendingToolCalls = nil
-					m.pendingToolIdx = 0
-					m.appState = stateInput
-					m.textarea.Focus()
-					return m, func() tea.Msg {
-						return toolCallResultMsg{CallID: call.ID, Name: call.Name, Error: fmt.Errorf("aborted by user")}
-					}
+				if m.toolAbortRequested {
+					return m, nil
 				}
-				m.pendingToolCalls = nil
-				m.pendingToolIdx = 0
-				m.appState = stateInput
-				m.textarea.Focus()
+				m.toolAbortRequested = true
+				m.killExec()
+				logger.L.Warn("tool: execution aborted by user")
+				m.appendOutput(errorStyle.Render("✗ Aborting tool…"))
+				m.refreshViewport()
+				if len(m.pendingToolCalls) == 0 {
+					m.toolAbortRequested = false
+					m.resetToInput()
+				}
 				return m, nil
 			}
 
@@ -1184,17 +1153,11 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 				// 'y' + Enter or just Enter when 'y' is pre-filled confirms the write.
 				cmd := strings.ToLower(strings.TrimSpace(m.cmdTextarea.Value()))
 				if cmd != "y" && cmd != "yes" {
-					m.appendOutput(confirmStyle.Render("✗ Write cancelled."))
-					m.pendingWrite = nil
-					m.pendingWriteCallID = ""
-					m.appState = stateInput
-					m.cmdTextarea.Blur()
-					m.textarea.Focus()
-					m.refreshViewport()
-					return m, nil
+					return m, m.rejectPendingWrite()
 				}
 				pw := m.pendingWrite
 				callID := m.pendingWriteCallID
+				toolName := m.pendingWriteName
 				m.pendingWrite = nil
 				m.pendingWriteCallID = ""
 				m.appState = stateExecutingTool
@@ -1206,23 +1169,51 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 				m.refreshViewport()
 				return m, tea.Batch(func() tea.Msg {
 					if err := CommitWrite(*pw); err != nil {
-						return toolCallResultMsg{CallID: callID, Name: "write_file", Error: err}
+						return toolCallResultMsg{CallID: callID, Name: toolName, Error: err}
 					}
-					return toolCallResultMsg{CallID: callID, Name: "write_file", Result: fmt.Sprintf("Successfully wrote %s", pw.Path)}
+					return toolCallResultMsg{CallID: callID, Name: toolName, Result: fmt.Sprintf("Successfully wrote %s", pw.Path)}
 				}, m.spinner.Tick)
 			case tea.KeyEsc:
-				m.pendingWrite = nil
-				m.pendingWriteCallID = ""
-				m.appState = stateInput
-				m.cmdTextarea.Blur()
-				m.textarea.Focus()
-				m.appendOutput(confirmStyle.Render("✗ Write cancelled."))
-				m.refreshViewport()
-				return m, nil
+				return m, m.rejectPendingWrite()
 			case tea.KeyCtrlC:
 				return m, tea.Quit
 			}
 
+			var cmd tea.Cmd
+			m.cmdTextarea, cmd = m.cmdTextarea.Update(msg)
+			return m, cmd
+
+		case stateConfirmingTool:
+			if handled, vpCmd := m.handleScrollKeys(msg); handled {
+				return m, vpCmd
+			}
+			switch msg.Type {
+			case tea.KeyEnter:
+				answer := strings.ToLower(strings.TrimSpace(m.cmdTextarea.Value()))
+				call := m.pendingConfirmCall
+				m.pendingConfirmCall = nil
+				m.cmdTextarea.Blur()
+				if call == nil {
+					m.resetToInput()
+					return m, nil
+				}
+				if answer != "y" && answer != "yes" {
+					return m, m.denyTool(*call)
+				}
+				logger.L.Info("tool: user approved", "name", call.Name)
+				return m, m.runApprovedTool(*call)
+			case tea.KeyEsc:
+				call := m.pendingConfirmCall
+				m.pendingConfirmCall = nil
+				m.cmdTextarea.Blur()
+				if call == nil {
+					m.resetToInput()
+					return m, nil
+				}
+				return m, m.denyTool(*call)
+			case tea.KeyCtrlC:
+				return m, tea.Quit
+			}
 			var cmd tea.Cmd
 			m.cmdTextarea, cmd = m.cmdTextarea.Update(msg)
 			return m, cmd
@@ -1375,11 +1366,11 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			// Highlight the block and prepare confirmation textarea.
 			block := codeBlockStyle.Render("```" + lang + "\n" + cmd + "\n```")
 			m.outputLines = append(m.outputLines, block)
-			
+
 			m.cmdTextarea.SetValue(cmd)
 			m.textarea.Blur()
 			m.cmdTextarea.Focus()
-			
+
 			m.refreshViewport()
 			return m, titleCmd
 		}
@@ -1417,7 +1408,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			label := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("$ " + m.pendingLang)
 			m.appendOutput(label)
 			m.appendOutput(execResultStyle.Render(msg.output))
-			
+
 			outStr := strings.ToLower(msg.output)
 			if strings.Contains(outStr, "incorrect password") || strings.Contains(outStr, "try again") {
 				m.sudoPassword = ""
@@ -1560,14 +1551,31 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		})
 		m.saveSession()
 
+		// User pressed Ctrl+C while this tool ran: answer the remaining calls
+		// and hand control back without calling the model again.
+		if m.toolAbortRequested {
+			m.toolAbortRequested = false
+			m.answerRemainingToolCalls(m.pendingToolIdx+1, "Aborted by user before execution.")
+			m.pendingToolCalls = nil
+			m.pendingToolIdx = 0
+			m.saveSession()
+			m.appendOutput(errorStyle.Render("✗ Tool aborted."))
+			m.resetToInput()
+			return m, nil
+		}
+
 		// 3 consecutive errors breaker
 		if m.consecutiveErrors >= 3 {
 			m.appendOutput(errorStyle.Render("⚠️ Loop Breaker Circuit: Blocked execution due to 3 consecutive tool errors"))
 			m.appendOutput(errorStyle.Render("Injecting error warning context to model to break failure cascade..."))
 			m.refreshViewport()
 
+			// Every tool_call in the assistant turn must get a result, or
+			// OpenAI-compatible APIs reject the next request (HTTP 400).
+			m.answerRemainingToolCalls(m.pendingToolIdx+1, "Skipped: loop breaker halted execution after 3 consecutive errors.")
 			m.pendingToolCalls = nil
 			m.pendingToolIdx = 0
+			m.consecutiveErrors = 0
 
 			m.history = append(m.history, llm.Message{
 				Role:    llm.RoleSystem,
@@ -1619,7 +1627,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			allowViewportUpdate = false
 		}
 	}
-	
+
 	if allowViewportUpdate {
 		var vpCmd tea.Cmd
 		m.viewport, vpCmd = m.viewport.Update(msg)
@@ -1684,6 +1692,13 @@ func (m Model) View() string {
 		b.WriteString(inputActiveStyle.Render(
 			lipgloss.JoinVertical(lipgloss.Left,
 				confirmStyle.Render(fmt.Sprintf("💾 Write to %s? Type 'y' and Enter to confirm, Esc to cancel:", path)),
+				m.cmdTextarea.View(),
+			),
+		))
+	case stateConfirmingTool:
+		b.WriteString(inputActiveStyle.Render(
+			lipgloss.JoinVertical(lipgloss.Left,
+				confirmStyle.Render("Allow this tool call? Type 'y' and Enter to allow, Esc to deny:"),
 				m.cmdTextarea.View(),
 			),
 		))
@@ -2104,6 +2119,14 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 			}
 		}
 
+	case stateConfirmingTool:
+		if m.pendingConfirmCall != nil {
+			args, _ := json.MarshalIndent(m.pendingConfirmCall.Args, "", "  ")
+			m.outputLines = append(m.outputLines,
+				confirmStyle.Render("⚠ Approval needed: "+m.pendingConfirmCall.Name),
+				codeBlockStyle.Render(truncateUTF8(string(args), 1500)))
+		}
+
 	case stateExecuting:
 		if m.pendingLang != "" {
 			block := codeBlockStyle.Render("```" + m.pendingLang + "\n" + m.pendingCmd + "\n```")
@@ -2146,7 +2169,13 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 	}
 }
 
+// needsSudo reports whether aig must collect a sudo password itself before
+// running cmd. With a graphical askpass helper (KDE ksshaskpass) available,
+// sudo prompts via a desktop dialog instead and aig never sees the password.
 func (m *Model) needsSudo(cmd string) bool {
+	if sandbox.AskpassHelper() != "" {
+		return false
+	}
 	matched, _ := regexp.MatchString(`\bsudo\b`, cmd)
 	return matched
 }
@@ -2199,7 +2228,7 @@ func (m *Model) recalculateDimensions() {
 		inputHeight = 3
 	case stateConfirmingCmd:
 		inputHeight = 8
-	case stateConfirmingWrite:
+	case stateConfirmingWrite, stateConfirmingTool:
 		inputHeight = 8
 	case stateInputSudoPassword:
 		inputHeight = 4
@@ -2229,7 +2258,7 @@ func (m *Model) recalculateDimensions() {
 	if m.renderer != nil && m.width != m.lastRendererWidth {
 		m.renderer, _ = glamour.NewTermRenderer(
 			glamour.WithStandardStyle("dark"),
-			glamour.WithWordWrap(m.viewport.Width - 4),
+			glamour.WithWordWrap(m.viewport.Width-4),
 		)
 		m.lastRendererWidth = m.width
 	}
@@ -2271,6 +2300,12 @@ func (m Model) submitPrompt(input string) Model {
 	})
 	m.saveSession()
 
+	// Loop-breaker counters are per user turn.
+	m.consecutiveSameCalls = 0
+	m.consecutiveErrors = 0
+	m.lastToolName = ""
+	m.lastArgsHash = ""
+
 	label := userLabelStyle.Render("You")
 	m.outputLines = append(m.outputLines,
 		label,
@@ -2294,23 +2329,31 @@ func (m *Model) startStreaming() []tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelStream = cancel
 
-	// Refresh the provider with the latest API key from config/env in case it was modified.
+	// Pick up a changed API key from config/env, but only rebuild the client
+	// when provider, model, or key actually changed.
 	freshKey := config.GetAPIKey(config.ProviderName(m.activeProvider))
-	if freshKey != "" {
+	if fp := m.activeProvider + "|" + m.activeModel + "|" + freshKey; freshKey != "" && fp != m.providerFingerprint {
 		if newProvider, err := llm.NewProvider(m.activeProvider, freshKey, m.activeModel); err == nil {
 			m.provider = newProvider
+			m.providerFingerprint = fp
 		}
 	}
+
+	// Snapshot everything the goroutine needs. It must not read the live
+	// Model, which the Update loop keeps mutating.
+	provider := m.provider
+	history := append([]llm.Message(nil), m.history...)
+	registry := m.mcpRegistry
 
 	// Background goroutine — calls the LLM provider.
 	streamCmd := func() tea.Msg {
 		// Prune to a default context limit (100k tokens approx ~400k chars)
-		prunedHistory := llm.PruneHistory(m.history, 100000)
+		prunedHistory := llm.PruneHistory(history, 100000)
 		// Build the combined tool list: native sandbox tools + any MCP-registered tools.
 		// If no MCP registry is wired (nil), this degrades cleanly to AgentTools() alone.
 		tools := AgentTools()
-		if m.mcpRegistry != nil {
-			tools = append(tools, m.mcpRegistry.LLMTools()...)
+		if registry != nil {
+			tools = append(tools, registry.LLMTools()...)
 		}
 
 		// Dynamically append the Plan-Action-Reflection directive if tools are present
@@ -2343,7 +2386,7 @@ func (m *Model) startStreaming() []tea.Cmd {
 			outgoingHistory = prunedHistory
 		}
 
-		toolCalls, reasoningContent, err := m.provider.StreamChat(ctx, outgoingHistory, tools, ch)
+		toolCalls, reasoningContent, err := provider.StreamChat(ctx, outgoingHistory, tools, ch)
 		if err != nil {
 			return streamErrMsg{err: err}
 		}
@@ -2416,14 +2459,14 @@ func (m *Model) runSandboxCmd() tea.Cmd {
 	m.stdinPipe = pipeW
 
 	// Pre-seed the sudo password if needed, then keep the write end open so
-	// the process can receive further input via Ctrl+I.
-	if m.sudoPassword != "" {
-		_, _ = fmt.Fprintln(pipeW, m.sudoPassword)
-	}
+	// the process can receive further input via Ctrl+I. io.Pipe writes block
+	// until read, so this must not run on the Update goroutine.
+	password := m.fallbackSudoPassword()
+	seedStdin(pipeW, password)
 
 	return func() tea.Msg {
 		result, err := sandbox.ExecuteWithStdin(ctx, cmd, pipeR, sandbox.Options{
-			SudoPassword: m.sudoPassword,
+			SudoPassword: password,
 		})
 		_ = pipeR.Close()
 		if err != nil {
@@ -2435,9 +2478,10 @@ func (m *Model) runSandboxCmd() tea.Cmd {
 }
 
 // processNextToolCall picks up the next call in pendingToolCalls and routes it:
-//   - MCP tools        → dispatched via Registry.Call() in a tea.Cmd goroutine
+//   - MCP tools        → stateConfirmingTool unless trusted/auto-approve, then Registry.Call()
 //   - run_command      → auto-approve (execute now) or stateConfirmingCmd
 //   - write_file / edit_file → stateConfirmingWrite with diff preview
+//   - web_fetch / reads outside the workspace → stateConfirmingTool unless auto-approve
 //   - everything else  → execute immediately, return toolCallResultMsg
 func (m *Model) processNextToolCall() tea.Cmd {
 	if m.pendingToolIdx >= len(m.pendingToolCalls) {
@@ -2459,8 +2503,14 @@ func (m *Model) processNextToolCall() tea.Cmd {
 		m.appendOutput(errorStyle.Render("Injecting warning context to model to break repetition..."))
 		m.refreshViewport()
 
+		// Answer this call and the rest of the batch so no tool_call is left
+		// without a result (OpenAI-compatible APIs reject that with HTTP 400).
+		m.answerRemainingToolCalls(m.pendingToolIdx, "Skipped: loop breaker blocked a repeated identical call.")
 		m.pendingToolCalls = nil
 		m.pendingToolIdx = 0
+		m.consecutiveSameCalls = 0
+		m.lastToolName = ""
+		m.lastArgsHash = ""
 
 		m.history = append(m.history, llm.Message{
 			Role:    llm.RoleSystem,
@@ -2475,6 +2525,9 @@ func (m *Model) processNextToolCall() tea.Cmd {
 	// MCP tools are checked before the native switch so that registry-registered
 	// names always win, even if a name ever collides with a built-in tool.
 	if m.mcpRegistry != nil && m.mcpRegistry.IsMCPTool(call.Name) {
+		if !m.autoApproveCommands && !m.mcpRegistry.IsTrusted(call.Name) {
+			return m.askToolApproval(call, "🔌 MCP tool "+call.Name)
+		}
 		return m.mcpToolCallCmd(call)
 	}
 
@@ -2495,32 +2548,9 @@ func (m *Model) processNextToolCall() tea.Cmd {
 			}
 
 			// Execute immediately without asking.
-			m.appState = stateExecutingTool
-			m.execStart = time.Now()
-			m.execTimeout = sandbox.DefaultTimeout
-			if v, ok := call.Args["timeout_seconds"].(float64); ok && v > 0 {
-				m.execTimeout = time.Duration(v) * time.Second
-			}
 			m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
 				fmt.Sprintf("⚡ run_command (auto): %s", command)))
-			m.refreshViewport()
-			callCopy := call
-			ctx, cancel := context.WithCancel(context.Background())
-			m.cancelExec = cancel
-			pipeR, pipeW := io.Pipe()
-			m.stdinPipe = pipeW
-			if m.sudoPassword != "" {
-				_, _ = fmt.Fprintln(pipeW, m.sudoPassword)
-			}
-			return tea.Batch(func() tea.Msg {
-				out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword, pipeR)
-				cancel()
-				_ = pipeR.Close()
-				if err != nil {
-					return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
-				}
-				return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: out}
-			}, m.spinner.Tick)
+			return m.startRunCommand(call, command)
 		}
 
 		// Prompt the user — reuse stateConfirmingCmd.
@@ -2551,6 +2581,7 @@ func (m *Model) processNextToolCall() tea.Cmd {
 		}
 		m.pendingWrite = pw
 		m.pendingWriteCallID = call.ID
+		m.pendingWriteName = call.Name
 
 		icon := "💾"
 		if call.Name == "edit_file" {
@@ -2581,22 +2612,32 @@ func (m *Model) processNextToolCall() tea.Cmd {
 		return nil
 
 	default:
-		// Safe read-only or web tools: execute immediately.
-		m.appState = stateExecutingTool
-		m.execStart = time.Now()
-		m.execTimeout = 5 * time.Second
-		m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
-			fmt.Sprintf("⚙ Tool: %s", call.Name)))
-		m.refreshViewport()
-		callCopy := call
-		return tea.Batch(func() tea.Msg {
-			resultStr, _, err := ExecuteToolWithWrite(callCopy)
-			if err != nil {
-				return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
+		if !m.autoApproveCommands {
+			if needs, reason := NativeToolNeedsApproval(call, m.workspaceRoot); needs {
+				return m.askToolApproval(call, "⚙ "+call.Name+" — "+reason)
 			}
-			return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: resultStr}
-		}, m.spinner.Tick)
+		}
+		return m.runNativeTool(call)
 	}
+}
+
+// runNativeTool executes a read-only/web native tool in a background command.
+func (m *Model) runNativeTool(call llm.ToolCall) tea.Cmd {
+	m.appState = stateExecutingTool
+	m.execStart = time.Now()
+	m.execTimeout = 5 * time.Second
+	m.cancelExec = nil
+	m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
+		fmt.Sprintf("⚙ Tool: %s", call.Name)))
+	m.refreshViewport()
+	callCopy := call
+	return tea.Batch(func() tea.Msg {
+		resultStr, _, err := ExecuteToolWithWrite(callCopy)
+		if err != nil {
+			return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
+		}
+		return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: resultStr}
+	}, m.spinner.Tick)
 }
 
 // mcpToolCallCmd dispatches a single MCP tool call as a non-blocking tea.Cmd.
@@ -2639,7 +2680,6 @@ func (m *Model) mcpToolCallCmd(call llm.ToolCall) tea.Cmd {
 		return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: result}
 	}, m.spinner.Tick)
 }
-
 
 // refreshViewport re-renders all output lines into the viewport and scrolls
 // to the bottom. Use this when new content has been appended (e.g. a new
@@ -2718,6 +2758,8 @@ func (m Model) statusBar() string {
 		statusText = "⚙ executing tool"
 	case stateConfirmingWrite:
 		statusText = "💾 write pending"
+	case stateConfirmingTool:
+		statusText = "⚠ tool approval pending"
 	case stateInputSudoPassword:
 		statusText = "🔒 entering sudo password"
 	default:
@@ -2818,7 +2860,7 @@ func helpOverlay() string {
 		"  /persona        List personas",
 		"  /persona <n>    Switch system prompt persona",
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  Agent Execution"),
-		"  /approve-tools on   Auto-execute run_command without prompting",
+		"  /approve-tools on   Auto-run commands and sensitive tools without prompting",
 		"  /approve-tools off  Require confirmation for every command (default)",
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  File macros"),
 		"  /read(path)     Attach file content to next message",
@@ -2841,38 +2883,40 @@ func hashArguments(args map[string]any) string {
 }
 
 // SplitReasoning splits the accumulated raw text stream into standard content
-// and reasoning blocks by scanning for <think> and </think> tags. It returns the
-// cleaned final response text, the aggregated reasoning block, and a boolean
-// indicating if the stream is currently inside an open, unclosed thinking block.
+// and reasoning blocks by scanning for <think>…</think> (or <thought>…</thought>)
+// tags. It returns the cleaned final response text, the aggregated reasoning
+// block, and a boolean indicating if the stream is currently inside an open,
+// unclosed thinking block.
 func SplitReasoning(input string) (string, string, bool) {
 	var sbContent, sbReasoning strings.Builder
-	pos := 0
-	n := len(input)
-	inThink := false
-	for pos < n {
-		thinkIdx := strings.Index(input[pos:], "<think>")
-		if thinkIdx == -1 {
-			if inThink {
-				sbReasoning.WriteString(input[pos:])
-			} else {
-				sbContent.WriteString(input[pos:])
-			}
-			break
+	rest := input
+	for {
+		openIdx, openTag, closeTag := findThinkOpen(rest)
+		if openIdx == -1 {
+			sbContent.WriteString(rest)
+			return sbContent.String(), sbReasoning.String(), false
 		}
-		// Write standard content up to <think> tag if we were not already in a think block.
-		// (though logically nesting think blocks shouldn't happen, we follow sequence).
-		sbContent.WriteString(input[pos : pos+thinkIdx])
-		pos += thinkIdx + 7
-		inThink = true
+		sbContent.WriteString(rest[:openIdx])
+		rest = rest[openIdx+len(openTag):]
 
-		endIdx := strings.Index(input[pos:], "</think>")
+		endIdx := strings.Index(rest, closeTag)
 		if endIdx == -1 {
-			sbReasoning.WriteString(input[pos:])
-			break
+			sbReasoning.WriteString(rest)
+			return sbContent.String(), sbReasoning.String(), true
 		}
-		sbReasoning.WriteString(input[pos : pos+endIdx])
-		pos += endIdx + 8
-		inThink = false
+		sbReasoning.WriteString(rest[:endIdx])
+		rest = rest[endIdx+len(closeTag):]
 	}
-	return sbContent.String(), sbReasoning.String(), inThink
+}
+
+// findThinkOpen returns the index of the earliest supported reasoning open tag
+// in s, along with that tag and its matching close tag.
+func findThinkOpen(s string) (int, string, string) {
+	best, open, closeTag := -1, "", ""
+	for _, pair := range [][2]string{{"<think>", "</think>"}, {"<thought>", "</thought>"}} {
+		if i := strings.Index(s, pair[0]); i != -1 && (best == -1 || i < best) {
+			best, open, closeTag = i, pair[0], pair[1]
+		}
+	}
+	return best, open, closeTag
 }

@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/sandbox"
@@ -30,10 +31,33 @@ type PendingWrite struct {
 	// Diff is a human-readable unified diff shown in the confirmation UI.
 	// Empty for new files (no previous content to diff against).
 	Diff string
+
+	// Original is the file content the diff was computed against, and Existed
+	// whether the file existed then. CommitWrite refuses to write if the file
+	// changed in the meantime, so a stale proposal can't clobber newer edits.
+	Original string
+	Existed  bool
 }
+
+// ErrStaleWrite is returned by CommitWrite when the target changed after the
+// write was proposed.
+var ErrStaleWrite = fmt.Errorf("file changed on disk since this write was proposed; re-read it and try again")
 
 // CommitWrite flushes a confirmed PendingWrite to disk.
 func CommitWrite(pw PendingWrite) error {
+	current, err := os.ReadFile(pw.Path)
+	switch {
+	case err == nil:
+		if !pw.Existed || string(current) != pw.Original {
+			return fmt.Errorf("write %s: %w", pw.Path, ErrStaleWrite)
+		}
+	case os.IsNotExist(err):
+		if pw.Existed {
+			return fmt.Errorf("write %s: %w", pw.Path, ErrStaleWrite)
+		}
+	default:
+		return fmt.Errorf("write_file: cannot verify %s: %w", pw.Path, err)
+	}
 	if err := os.MkdirAll(filepath.Dir(pw.Path), 0o750); err != nil {
 		return fmt.Errorf("write_file: cannot create parent directory: %w", err)
 	}
@@ -283,14 +307,14 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 			header := fmt.Sprintf("// %s  lines %d-%d (of %d)\n", path, start, end, total)
 			content := header + strings.Join(selected, "\n")
 			if len(content) > maxBytes {
-				content = content[:maxBytes] + "\n// ... (truncated at 50 KB)"
+				content = truncateUTF8(content, maxBytes) + "\n// ... (truncated at 50 KB — use start_line/end_line)"
 			}
 			return content, nil, nil
 		}
 
 		content := string(data)
 		if len(content) > maxBytes {
-			content = content[:maxBytes] + "\n// ... (truncated at 50 KB)"
+			content = truncateUTF8(content, maxBytes) + "\n// ... (truncated at 50 KB — use start_line/end_line)"
 		}
 		return content, nil, nil
 
@@ -304,9 +328,9 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 		if !ok {
 			return "", nil, fmt.Errorf("write_file: missing 'content' argument")
 		}
-		existing, _ := os.ReadFile(path)
+		existing, readErr := os.ReadFile(path)
 		diff := simpleDiff(string(existing), content)
-		return "", &PendingWrite{Path: path, Content: content, Diff: diff}, ErrWriteConfirmationRequired
+		return "", &PendingWrite{Path: path, Content: content, Diff: diff, Original: string(existing), Existed: readErr == nil}, ErrWriteConfirmationRequired
 
 	// ── edit_file ────────────────────────────────────────────────────────────
 	case "edit_file":
@@ -341,7 +365,7 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 
 		newFileStr := strings.Replace(fileStr, oldContent, newContent, 1)
 		diff := simpleDiff(fileStr, newFileStr)
-		return "", &PendingWrite{Path: path, Content: newFileStr, Diff: diff}, ErrWriteConfirmationRequired
+		return "", &PendingWrite{Path: path, Content: newFileStr, Diff: diff, Original: fileStr, Existed: true}, ErrWriteConfirmationRequired
 
 	// ── run_command ──────────────────────────────────────────────────────────
 	// run_command is gated by the TUI (auto-approve or confirmation dialog).
@@ -404,10 +428,24 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 		const maxMatches = 50
 
 		walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
+			if err != nil {
+				if d != nil && d.IsDir() && path != dir {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.IsDir() {
+				// Previously directories were only "not searched themselves",
+				// so .git and node_modules were still fully descended into.
+				if path != dir && (workspace.IsIgnoredDir(d.Name()) || strings.HasPrefix(d.Name(), ".")) {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 			if strings.HasPrefix(d.Name(), ".") {
+				return nil
+			}
+			if info, err := d.Info(); err != nil || info.Size() > maxSearchFileBytes {
 				return nil
 			}
 			if fileGlob != "" {
@@ -417,13 +455,17 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 				}
 			}
 			data, err := os.ReadFile(path)
-			if err != nil {
+			if err != nil || looksBinary(data) {
 				return nil
 			}
 			lines := strings.Split(string(data), "\n")
 			for i, line := range lines {
 				if re.MatchString(line) {
-					matches = append(matches, fmt.Sprintf("%s:%d: %s", path, i+1, strings.TrimSpace(line)))
+					line = strings.TrimSpace(line)
+					if len(line) > 300 {
+						line = truncateUTF8(line, 300) + "…"
+					}
+					matches = append(matches, fmt.Sprintf("%s:%d: %s", path, i+1, line))
 					matchCount++
 					if matchCount >= maxMatches {
 						return io.EOF
@@ -479,29 +521,21 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 		}
 		defer resp.Body.Close()
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBodyBytes))
 		if err != nil {
 			return "", nil, err
 		}
 		htmlBody := string(body)
 
-		// Extract result titles.
-		reTitle := regexp.MustCompile(`(?i)class=["']result-link["'][^>]*>(.*?)</a>`)
-		titles := reTitle.FindAllStringSubmatch(htmlBody, 8)
-
-		// Extract result URLs.
-		reURL := regexp.MustCompile(`(?i)<a[^>]+class=["']result-link["'][^>]*href=["']([^"']+)["']`)
-		urls := reURL.FindAllStringSubmatch(htmlBody, 8)
-
-		// Extract snippets.
-		reSnippet := regexp.MustCompile(`(?i)class=["']result-snippet["'][^>]*>(.*?)</td>`)
-		snippets := reSnippet.FindAllStringSubmatch(htmlBody, 8)
+		titles := reDDGTitle.FindAllStringSubmatch(htmlBody, 8)
+		urls := reDDGURL.FindAllStringSubmatch(htmlBody, 8)
+		snippets := reDDGSnippet.FindAllStringSubmatch(htmlBody, 8)
 
 		if len(snippets) == 0 && len(titles) == 0 {
 			return "No results found for: " + query, nil, nil
 		}
 
-		stripTags := regexp.MustCompile(`<[^>]*>`)
+		stripTags := reTag
 		var results []string
 		n := len(snippets)
 		if len(titles) > n {
@@ -556,41 +590,39 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 			return "", nil, fmt.Errorf("web_fetch: HTTP %d for %s", resp.StatusCode, targetURL)
 		}
 
-		bodyBytes, err := io.ReadAll(resp.Body)
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBodyBytes))
 		if err != nil {
 			return "", nil, err
 		}
-		htmlStr := string(bodyBytes)
+		htmlStr := strings.ToValidUTF8(string(bodyBytes), "")
 
 		// Preserve code blocks before stripping tags.
-		reCode := regexp.MustCompile(`(?is)<(pre|code)[^>]*>(.*?)</(pre|code)>`)
-		htmlStr = reCode.ReplaceAllStringFunc(htmlStr, func(m string) string {
-			inner := reCode.FindStringSubmatch(m)
+		htmlStr = reCodeBlock.ReplaceAllStringFunc(htmlStr, func(m string) string {
+			inner := reCodeBlock.FindStringSubmatch(m)
 			if len(inner) < 3 {
 				return m
 			}
-			code := regexp.MustCompile(`<[^>]*>`).ReplaceAllString(inner[2], "")
+			code := reTag.ReplaceAllString(inner[2], "")
 			return "\n```\n" + html.UnescapeString(code) + "\n```\n"
 		})
 
 		// Remove noisy structural sections.
-		for _, tag := range []string{"script", "style", "nav", "header", "footer", "aside", "noscript"} {
-			re := regexp.MustCompile(`(?is)<` + tag + `[^>]*>.*?</` + tag + `>`)
+		for _, re := range reNoisySections {
 			htmlStr = re.ReplaceAllString(htmlStr, " ")
 		}
 
 		// Strip remaining HTML tags.
-		htmlStr = regexp.MustCompile(`(?is)<[^>]*>`).ReplaceAllString(htmlStr, " ")
+		htmlStr = reTag.ReplaceAllString(htmlStr, " ")
 
 		// Decode entities and collapse whitespace.
 		text := html.UnescapeString(htmlStr)
-		text = regexp.MustCompile(`(?m)^\s+$`).ReplaceAllString(text, "")
-		text = regexp.MustCompile(`\n{3,}`).ReplaceAllString(text, "\n\n")
-		text = regexp.MustCompile(`[ \t]{2,}`).ReplaceAllString(text, " ")
+		text = reBlankLine.ReplaceAllString(text, "")
+		text = reManyNewlines.ReplaceAllString(text, "\n\n")
+		text = reManySpaces.ReplaceAllString(text, " ")
 
 		const maxBytes = 30 * 1024 // 30 KB
 		if len(text) > maxBytes {
-			text = text[:maxBytes] + "\n... (truncated at 30 KB)"
+			text = truncateUTF8(text, maxBytes) + "\n... (truncated at 30 KB)"
 		}
 		return strings.TrimSpace(text), nil, nil
 
@@ -631,8 +663,96 @@ func ExecuteRunCommand(ctx context.Context, call llm.ToolCall, sudoPassword stri
 	return result.Combined(), nil
 }
 
-
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+const (
+	// maxHTTPBodyBytes caps how much of a web response is read into memory.
+	maxHTTPBodyBytes = 5 << 20 // 5 MiB
+	// maxSearchFileBytes: search_regex skips files larger than this.
+	maxSearchFileBytes = 2 << 20 // 2 MiB
+)
+
+var (
+	reTag          = regexp.MustCompile(`(?is)<[^>]*>`)
+	reCodeBlock    = regexp.MustCompile(`(?is)<(pre|code)[^>]*>(.*?)</(pre|code)>`)
+	reBlankLine    = regexp.MustCompile(`(?m)^\s+$`)
+	reManyNewlines = regexp.MustCompile(`\n{3,}`)
+	reManySpaces   = regexp.MustCompile(`[ \t]{2,}`)
+	reDDGTitle     = regexp.MustCompile(`(?i)class=["']result-link["'][^>]*>(.*?)</a>`)
+	reDDGURL       = regexp.MustCompile(`(?i)<a[^>]+class=["']result-link["'][^>]*href=["']([^"']+)["']`)
+	reDDGSnippet   = regexp.MustCompile(`(?i)class=["']result-snippet["'][^>]*>(.*?)</td>`)
+
+	reNoisySections = func() []*regexp.Regexp {
+		var out []*regexp.Regexp
+		for _, tag := range []string{"script", "style", "nav", "header", "footer", "aside", "noscript"} {
+			out = append(out, regexp.MustCompile(`(?is)<`+tag+`[^>]*>.*?</`+tag+`>`))
+		}
+		return out
+	}()
+)
+
+// truncateUTF8 cuts s to at most max bytes without splitting a multi-byte rune.
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// looksBinary reports whether data appears to be a binary file (NUL byte in
+// the first 8 KB), which search_regex skips.
+func looksBinary(data []byte) bool {
+	n := len(data)
+	if n > 8192 {
+		n = 8192
+	}
+	for _, b := range data[:n] {
+		if b == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// toolPathArgs lists, per read-only filesystem tool, which argument holds the
+// path and its default.
+var toolPathArgs = map[string][2]string{
+	"read_file":      {"path", ""},
+	"list_directory": {"path", "."},
+	"search_regex":   {"dir", "."},
+	"map_workspace":  {"dir", "."},
+}
+
+// NativeToolNeedsApproval decides whether a native (non run_command,
+// non-write) tool call must be confirmed by the user before it runs.
+//
+// Reading inside the workspace root runs freely. Reading outside it, and
+// fetching arbitrary URLs, need approval: together, unrestricted reads and
+// unrestricted outbound requests let injected instructions (from a web page or
+// a file) exfiltrate secrets such as ~/.ssh keys.
+func NativeToolNeedsApproval(call llm.ToolCall, workspaceRoot string) (bool, string) {
+	if call.Name == "web_fetch" || call.Name == "web_scrape" {
+		u, _ := call.Args["url"].(string)
+		return true, "fetch URL: " + u
+	}
+	if spec, ok := toolPathArgs[call.Name]; ok {
+		p, _ := call.Args[spec[0]].(string)
+		if p == "" {
+			p = spec[1]
+		}
+		if p == "" || workspaceRoot == "" {
+			return false, ""
+		}
+		if !workspace.IsInside(workspaceRoot, p) {
+			return true, "access outside the workspace: " + p
+		}
+	}
+	return false, ""
+}
 
 // intArg extracts an integer from a tool args map, handling both int and float64
 // (JSON numbers are always float64 after unmarshalling).
