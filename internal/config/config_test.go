@@ -160,3 +160,46 @@ func TestLoadReportsInvalidJSON(t *testing.T) {
 		t.Fatal("expected an error for malformed config JSON")
 	}
 }
+
+func TestNIMProviderResolution(t *testing.T) {
+	isolateHome(t)
+	t.Setenv("NVIDIA_API_KEY", "")
+	t.Setenv("NIM_BASE_URL", "")
+
+	for _, alias := range []string{"nim", "NVIDIA", "nvidia-nim"} {
+		if NormalizeProvider(alias) != ProviderNIM {
+			t.Errorf("%q should normalize to nim", alias)
+		}
+	}
+
+	// Hosted NIM without a key → error mentioning NVIDIA_API_KEY.
+	if _, err := Load("nim", "", ""); err == nil || !strings.Contains(err.Error(), "NVIDIA_API_KEY") {
+		t.Fatalf("expected missing NVIDIA_API_KEY error, got %v", err)
+	}
+
+	// Key from env; default model; default_model of another provider ignored.
+	if err := os.WriteFile(Path(), []byte(`{"default_provider":"gemini","default_model":"gemini-2.5-pro"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NVIDIA_API_KEY", "nvapi-test")
+	cfg, err := Load("nvidia", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != ProviderNIM || cfg.APIKey != "nvapi-test" || cfg.Model != DefaultModel(ProviderNIM) {
+		t.Fatalf("unexpected config: provider=%s key=%s model=%s", cfg.Provider, cfg.APIKey, cfg.Model)
+	}
+
+	// Self-hosted NIM: base URL set, key optional.
+	t.Setenv("NVIDIA_API_KEY", "")
+	if err := os.WriteFile(Path(), []byte(`{"nim_base_url":"http://localhost:8000/v1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ep, err := ResolveEndpoint(ProviderNIM)
+	if err != nil {
+		t.Fatalf("self-hosted NIM should not need a key: %v", err)
+	}
+	if ep.BaseURL != "http://localhost:8000/v1" {
+		t.Errorf("base URL = %q", ep.BaseURL)
+	}
+}

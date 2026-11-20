@@ -253,7 +253,7 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 
 	m := &Model{
 		workspaceRoot:       workspaceRoot,
-		providerFingerprint: providerName + "|" + modelName + "|" + config.GetAPIKey(config.ProviderName(providerName)),
+		providerFingerprint: endpointFingerprint(providerName, modelName),
 		appState:            stateInput,
 		history:             activeSession.History,
 		provider:            provider,
@@ -337,6 +337,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						"/load",
 						"/map",
 						"/model",
+						"/models",
 						"/new",
 						"/persona",
 						"/provider",
@@ -407,6 +408,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						m.appendOutput("  /clear             Clear display output (keeps system prompt)")
 						m.appendOutput("  /model             List available models for current provider")
 						m.appendOutput("  /model <id>        Switch active model (keeps history)")
+						m.appendOutput("  /models [filter]   Pick from the provider's live model list (NIM), filtered")
 						m.appendOutput("  /provider          List available providers")
 						m.appendOutput("  /provider <name>   Switch active provider (keeps history)")
 						m.appendOutput("  /persona           List available personas")
@@ -598,44 +600,24 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						break
 					}
 
+					// ── /models [filter] — live model picker ───────────────────
+					if input == "/models" || strings.HasPrefix(input, "/models ") {
+						filter := strings.TrimSpace(strings.TrimPrefix(input, "/models"))
+						cmds = append(cmds, m.openModelPicker(filter))
+						break
+					}
+
 					// ── /model [name] ──────────────────────────────────────────
 					if strings.HasPrefix(input, "/model") {
 						arg := strings.TrimSpace(strings.TrimPrefix(input, "/model"))
 
 						if arg == "" {
-							prov := config.ProviderName(m.activeProvider)
-							models, ok := config.KnownModels[prov]
-							if !ok || len(models) == 0 {
-								m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("  (no known models for this provider)"))
-								m.refreshViewport()
-								break
-							}
-							m.selectionItems = nil
-							m.selectionIdx = 0
-							m.selectionType = "model"
-							for _, pair := range models {
-								label := fmt.Sprintf("%s (%s)", pair[1], pair[0])
-								if pair[0] == m.activeModel {
-									label += " (active)"
-								}
-								m.selectionItems = append(m.selectionItems, selectionItem{
-									ID:    pair[0],
-									Label: label,
-								})
-							}
-							m.appState = stateSelecting
-							m.textarea.Blur()
+							cmds = append(cmds, m.openModelPicker(""))
 							break
 						}
 
 						// Switch to the named model (keep provider, keep history)
-						apiKey := config.GetAPIKey(config.ProviderName(m.activeProvider))
-						if apiKey == "" {
-							m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ No API key stored for provider %q", m.activeProvider)))
-							m.refreshViewport()
-							break
-						}
-						newProvider, err := llm.NewProvider(m.activeProvider, apiKey, arg)
+						newProvider, err := m.buildProvider(m.activeProvider, arg)
 						if err != nil {
 							m.appendOutput(errorStyle.Render("✗ Failed to switch model: " + err.Error()))
 						} else {
@@ -657,12 +639,15 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						arg := strings.TrimSpace(strings.TrimPrefix(input, "/provider"))
 
 						if arg == "" {
-							providers := []string{"gemini", "deepseek"}
 							m.selectionItems = nil
 							m.selectionIdx = 0
 							m.selectionType = "provider"
-							for _, p := range providers {
+							for _, pn := range config.Providers() {
+								p := string(pn)
 								label := p
+								if pn == config.ProviderNIM {
+									label += " — NVIDIA NIM"
+								}
 								if p == m.activeProvider {
 									label += " (active)"
 								}
@@ -676,16 +661,9 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 							break
 						}
 
-						arg = strings.ToLower(arg)
-						apiKey := config.GetAPIKey(config.ProviderName(arg))
-						if apiKey == "" {
-							m.appendOutput(errorStyle.Render(fmt.Sprintf(
-								"✗ No API key configured for %q. Set it in ~/.config/aig/config.json or via environment variable.", arg)))
-							m.refreshViewport()
-							break
-						}
+						arg = string(config.NormalizeProvider(arg))
 						defaultModel := string(config.DefaultModel(config.ProviderName(arg)))
-						newProvider, err := llm.NewProvider(arg, apiKey, defaultModel)
+						newProvider, err := m.buildProvider(arg, defaultModel)
 						if err != nil {
 							m.appendOutput(errorStyle.Render("✗ Failed to switch provider: " + err.Error()))
 						} else {
@@ -1596,6 +1574,9 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		m.pendingToolIdx = 0
 		return m, tea.Batch(m.startStreaming()...)
 
+	case modelListMsg:
+		return m.showModelPicker(msg), nil
+
 	case sessionTitleMsg:
 		if string(msg) != "" && m.activeSession != nil {
 			m.activeSession.Name = string(msg)
@@ -1827,13 +1808,7 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 			m.activeSession.Model = id
 			m.saveSession()
 		}
-		apiKey := config.GetAPIKey(config.ProviderName(m.activeProvider))
-		if apiKey == "" {
-			m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ No API key stored for provider %q", m.activeProvider)))
-			m.refreshViewport()
-			return m, nil
-		}
-		newProvider, err := llm.NewProvider(m.activeProvider, apiKey, id)
+		newProvider, err := m.buildProvider(m.activeProvider, id)
 		if err != nil {
 			m.appendOutput(errorStyle.Render("✗ Failed to switch model: " + err.Error()))
 		} else {
@@ -1858,12 +1833,8 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 		if s.Model != "" {
 			m.activeModel = s.Model
 		}
-		apiKey := config.GetAPIKey(config.ProviderName(m.activeProvider))
-		if apiKey != "" {
-			newProvider, err := llm.NewProvider(m.activeProvider, apiKey, m.activeModel)
-			if err == nil {
-				m.provider = newProvider
-			}
+		if newProvider, err := m.buildProvider(m.activeProvider, m.activeModel); err == nil {
+			m.provider = newProvider
 		}
 		m.loadHistory(s.History, false)
 		m.titleGenerated = false
@@ -1871,15 +1842,8 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 		return m, nil
 
 	case "provider":
-		apiKey := config.GetAPIKey(config.ProviderName(id))
-		if apiKey == "" {
-			m.appendOutput(errorStyle.Render(fmt.Sprintf(
-				"✗ No API key configured for %q. Set it in ~/.config/aig/config.json or via environment variable.", id)))
-			m.refreshViewport()
-			return m, nil
-		}
 		defaultModel := string(config.DefaultModel(config.ProviderName(id)))
-		newProvider, err := llm.NewProvider(id, apiKey, defaultModel)
+		newProvider, err := m.buildProvider(id, defaultModel)
 		if err != nil {
 			m.appendOutput(errorStyle.Render("✗ Failed to switch provider: " + err.Error()))
 		} else {
@@ -2331,11 +2295,9 @@ func (m *Model) startStreaming() []tea.Cmd {
 
 	// Pick up a changed API key from config/env, but only rebuild the client
 	// when provider, model, or key actually changed.
-	freshKey := config.GetAPIKey(config.ProviderName(m.activeProvider))
-	if fp := m.activeProvider + "|" + m.activeModel + "|" + freshKey; freshKey != "" && fp != m.providerFingerprint {
-		if newProvider, err := llm.NewProvider(m.activeProvider, freshKey, m.activeModel); err == nil {
+	if fp := endpointFingerprint(m.activeProvider, m.activeModel); fp != "" && fp != m.providerFingerprint {
+		if newProvider, err := m.buildProvider(m.activeProvider, m.activeModel); err == nil {
 			m.provider = newProvider
-			m.providerFingerprint = fp
 		}
 	}
 

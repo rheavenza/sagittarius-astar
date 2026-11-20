@@ -5,6 +5,7 @@
 //	aig [flags]
 //	aig --provider gemini --model gemini-2.0-flash
 //	aig --provider deepseek --model deepseek-chat
+//	aig --provider nim --model meta/llama-3.3-70b-instruct
 //	aig --persona sysadmin         # use custom prompt persona
 //	aig --resume 20260521-120000   # resume previous session
 //	aig --log-level debug          # verbose file logging
@@ -52,7 +53,7 @@ var rootCmd = &cobra.Command{
 	Use:   "aig",
 	Short: "aig — terminal-based AI agent (Sagittarius A*)",
 	Long: `aig is a cross-platform, terminal-based AI agent that supports
-multiple LLM providers (Gemini, DeepSeek) and can securely execute
+multiple LLM providers (Gemini, DeepSeek, NVIDIA NIM) and can securely execute
 shell commands with your explicit consent.
 
 Configuration file is located at: ~/.config/aig/config.json
@@ -62,6 +63,7 @@ Logs are written to: ~/.cache/aig/aig.log
 Examples:
   aig
   aig --provider deepseek
+  aig --provider nim --model meta/llama-3.3-70b-instruct   # NVIDIA_API_KEY
   aig --persona sysadmin
   aig --resume 20260521-170000
   aig --log-level debug`,
@@ -71,7 +73,7 @@ Examples:
 func init() {
 	rootCmd.PersistentFlags().StringVarP(
 		&flagProvider, "provider", "p", "",
-		"LLM provider to use (gemini | deepseek)",
+		"LLM provider to use (gemini | deepseek | nim)",
 	)
 	rootCmd.PersistentFlags().StringVarP(
 		&flagModel, "model", "m", "",
@@ -179,15 +181,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 	)
 
 	// ── Provider ──────────────────────────────────────────────────────────────
-	var provider llm.Provider
-	switch cfg.Provider {
-	case config.ProviderGemini:
-		provider, err = llm.NewGeminiProvider(cfg.APIKey, cfg.Model)
-	case config.ProviderDeepSeek:
-		provider, err = llm.NewDeepSeekProvider(cfg.APIKey, cfg.Model)
-	default:
-		return fmt.Errorf("unknown provider: %s", cfg.Provider)
-	}
+	provider, err := llm.NewProvider(string(cfg.Provider), cfg.APIKey, cfg.Model, cfg.BaseURL)
 	if err != nil {
 		logger.L.Error("provider init failed", "provider", cfg.Provider, "error", err)
 		return fmt.Errorf("failed to initialize provider: %w", err)

@@ -54,15 +54,18 @@ type Provider interface {
 	StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) (toolCalls []ToolCall, reasoningContent string, err error)
 }
 
-// NewProvider constructs a Provider from a provider name, API key, and model string.
+// NewProvider constructs a Provider from a provider name, API key, model, and
+// optional base URL (only used by OpenAI-compatible backends; "" = default).
 // This is used for runtime provider/model switching inside the TUI.
-func NewProvider(providerName, apiKey, model string) (Provider, error) {
+func NewProvider(providerName, apiKey, model, baseURL string) (Provider, error) {
 	switch providerName {
 	case "gemini":
 		return NewGeminiProvider(apiKey, model)
 	case "deepseek":
 		return NewDeepSeekProvider(apiKey, model)
+	case "nim":
+		return NewNIMProvider(apiKey, model, baseURL)
 	default:
-		return nil, fmt.Errorf("llm: unknown provider %q (valid: gemini, deepseek)", providerName)
+		return nil, fmt.Errorf("llm: unknown provider %q (valid: gemini, deepseek, nim)", providerName)
 	}
 }

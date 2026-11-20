@@ -133,3 +133,21 @@ func TestSearchRegexSkipsIgnoredDirsAndBinaries(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildModelItems(t *testing.T) {
+	known := [][2]string{{"meta/llama-3.3-70b-instruct", "Llama 3.3 70B"}}
+	live := []string{"meta/llama-3.3-70b-instruct", "moonshotai/kimi-k3", "google/gemma-4-31b-it"}
+
+	all := buildModelItems(known, live, "", "moonshotai/kimi-k3")
+	if len(all) != 3 || all[0].ID != "meta/llama-3.3-70b-instruct" {
+		t.Fatalf("expected known first and deduplicated: %+v", all)
+	}
+	if !strings.Contains(all[1].Label, "(active)") {
+		t.Errorf("active model not marked: %+v", all[1])
+	}
+
+	filtered := buildModelItems(known, live, "GEMMA", "")
+	if len(filtered) != 1 || filtered[0].ID != "google/gemma-4-31b-it" {
+		t.Fatalf("filter failed: %+v", filtered)
+	}
+}

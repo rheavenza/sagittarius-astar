@@ -20,6 +20,10 @@ type ProviderName string
 const (
 	ProviderGemini   ProviderName = "gemini"
 	ProviderDeepSeek ProviderName = "deepseek"
+	// ProviderNIM is NVIDIA NIM: the hosted API at integrate.api.nvidia.com
+	// or a self-hosted NIM container (set nim_base_url). "nvidia" is accepted
+	// as an alias.
+	ProviderNIM ProviderName = "nim"
 )
 
 // KnownModels lists the available models for each provider.
@@ -34,6 +38,13 @@ var KnownModels = map[ProviderName][][2]string{
 		{"deepseek-v4-flash", "DeepSeek V4 Flash (default)"},
 		{"deepseek-v4-pro", "DeepSeek V4 Pro (reasoner)"},
 	},
+	// A few starting points; /model also fetches the live catalog from the
+	// NIM endpoint, which changes often.
+	ProviderNIM: {
+		{"meta/llama-3.3-70b-instruct", "Llama 3.3 70B Instruct (default)"},
+		{"moonshotai/kimi-k3", "Kimi K3"},
+		{"google/gemma-4-31b-it", "Gemma 4 31B IT"},
+	},
 }
 
 // Config holds all runtime configuration for aig.
@@ -41,6 +52,7 @@ type Config struct {
 	Provider     ProviderName
 	Model        string
 	APIKey       string
+	BaseURL      string // OpenAI-compatible backends only; "" = provider default
 	Persona      string
 	SystemPrompt string
 }
@@ -68,12 +80,16 @@ type MCPServerConfig struct {
 
 // FileConfig represents the JSON structure saved in ~/.config/aig/config.json.
 type FileConfig struct {
-	DefaultProvider string            `json:"default_provider"`
-	DefaultModel    string            `json:"default_model"`
-	DefaultPersona  string            `json:"default_persona,omitempty"`
-	GeminiAPIKey    string            `json:"gemini_api_key,omitempty"`
-	DeepSeekAPIKey  string            `json:"deepseek_api_key,omitempty"`
-	Personas        map[string]string `json:"personas,omitempty"`
+	DefaultProvider string `json:"default_provider"`
+	DefaultModel    string `json:"default_model"`
+	DefaultPersona  string `json:"default_persona,omitempty"`
+	GeminiAPIKey    string `json:"gemini_api_key,omitempty"`
+	DeepSeekAPIKey  string `json:"deepseek_api_key,omitempty"`
+	NvidiaAPIKey    string `json:"nvidia_api_key,omitempty"`
+	// NIMBaseURL overrides the NIM endpoint, e.g. "http://localhost:8000/v1"
+	// for a self-hosted NIM container (no API key needed then).
+	NIMBaseURL string            `json:"nim_base_url,omitempty"`
+	Personas   map[string]string `json:"personas,omitempty"`
 	// MCPServers is an optional map of logical server names to their spawn configs.
 	// Leave empty (or omit) to run aig without any MCP servers.
 	MCPServers map[string]MCPServerConfig `json:"mcp_servers,omitempty"`
@@ -174,6 +190,8 @@ func DefaultModel(p ProviderName) string {
 	switch p {
 	case ProviderDeepSeek:
 		return "deepseek-v4-flash"
+	case ProviderNIM:
+		return "meta/llama-3.3-70b-instruct"
 	default:
 		return "gemini-2.5-flash"
 	}
@@ -285,6 +303,7 @@ func WriteDefaultConfig(path string) error {
 		DefaultPersona:  "coder",
 		GeminiAPIKey:    "",
 		DeepSeekAPIKey:  "",
+		NvidiaAPIKey:    "",
 		// Personas is left empty: built-ins are merged in at load time, so
 		// improvements to them take effect. Add your own personas here.
 		// MCPServers is nil by default so the key is omitted from the written JSON.
@@ -324,30 +343,27 @@ func Load(providerOverride ProviderName, modelOverride string, personaName strin
 	if providerStr == "" {
 		providerStr = "gemini"
 	}
-	provider := ProviderName(strings.ToLower(providerStr))
+	provider := NormalizeProvider(providerStr)
 
-	// 2. Resolve Model (CLI override > File config > Default)
+	// 2. Resolve Model (CLI override > File config > Default). default_model
+	// belongs to default_provider, so it is ignored for any other provider
+	// (e.g. a Gemini model name must not be sent to NIM).
 	model := modelOverride
-	if model == "" {
+	fileProvider := NormalizeProvider(fc.DefaultProvider)
+	if fileProvider == "" {
+		fileProvider = ProviderGemini
+	}
+	if model == "" && provider == fileProvider {
 		model = fc.DefaultModel
 	}
 	if model == "" {
 		model = DefaultModel(provider)
 	}
 
-	// 3. Resolve API Key (Environment variable > File config)
-	var envName string
-	switch provider {
-	case ProviderGemini:
-		envName = "GEMINI_API_KEY"
-	case ProviderDeepSeek:
-		envName = "DEEPSEEK_API_KEY"
-	default:
-		return nil, fmt.Errorf("unknown provider: %q (valid: gemini, deepseek)", provider)
-	}
-	apiKey := apiKeyFrom(provider, fc)
-	if apiKey == "" {
-		return nil, fmt.Errorf("missing API key for %s. Either set environment variable %s or configure it in %s", provider, envName, cfgPath)
+	// 3. Resolve API Key / endpoint (Environment variable > File config)
+	ep, err := endpointFrom(provider, fc)
+	if err != nil {
+		return nil, err
 	}
 
 	// 4. Resolve System Prompt (Persona). A local ./aig.md is NOT picked up
@@ -368,7 +384,8 @@ func Load(providerOverride ProviderName, modelOverride string, personaName strin
 	return &Config{
 		Provider:     provider,
 		Model:        model,
-		APIKey:       apiKey,
+		APIKey:       ep.APIKey,
+		BaseURL:      ep.BaseURL,
 		Persona:      personaName,
 		SystemPrompt: systemPrompt,
 	}, nil
@@ -400,8 +417,68 @@ func apiKeyFrom(provider ProviderName, fc *FileConfig) string {
 			return v
 		}
 		return fc.DeepSeekAPIKey
+	case ProviderNIM:
+		if v := os.Getenv("NVIDIA_API_KEY"); v != "" {
+			return v
+		}
+		return fc.NvidiaAPIKey
 	}
 	return ""
+}
+
+// Providers lists the supported providers in display order.
+func Providers() []ProviderName {
+	return []ProviderName{ProviderGemini, ProviderDeepSeek, ProviderNIM}
+}
+
+// NormalizeProvider lower-cases a provider name and resolves aliases
+// ("nvidia", "nvidia-nim" → "nim").
+func NormalizeProvider(s string) ProviderName {
+	switch v := strings.ToLower(strings.TrimSpace(s)); v {
+	case "nvidia", "nvidia-nim", "nvidia_nim":
+		return ProviderNIM
+	default:
+		return ProviderName(v)
+	}
+}
+
+// Endpoint is everything needed to construct a provider client.
+type Endpoint struct {
+	APIKey  string
+	BaseURL string // "" = provider default
+}
+
+// ResolveEndpoint returns the API key and base URL for a provider, re-reading
+// config and environment each time (so edited keys are picked up live).
+func ResolveEndpoint(provider ProviderName) (Endpoint, error) {
+	return endpointFrom(provider, LoadFileConfig())
+}
+
+func endpointFrom(provider ProviderName, fc *FileConfig) (Endpoint, error) {
+	var envName string
+	ep := Endpoint{APIKey: apiKeyFrom(provider, fc)}
+	switch provider {
+	case ProviderGemini:
+		envName = "GEMINI_API_KEY"
+	case ProviderDeepSeek:
+		envName = "DEEPSEEK_API_KEY"
+	case ProviderNIM:
+		envName = "NVIDIA_API_KEY"
+		ep.BaseURL = os.Getenv("NIM_BASE_URL")
+		if ep.BaseURL == "" {
+			ep.BaseURL = fc.NIMBaseURL
+		}
+		// A self-hosted NIM usually needs no key.
+		if ep.APIKey == "" && ep.BaseURL != "" {
+			return ep, nil
+		}
+	default:
+		return ep, fmt.Errorf("unknown provider: %q (valid: gemini, deepseek, nim)", provider)
+	}
+	if ep.APIKey == "" {
+		return ep, fmt.Errorf("missing API key for %s. Either set environment variable %s or configure it in %s", provider, envName, Path())
+	}
+	return ep, nil
 }
 
 // ── Local prompt trust store ──────────────────────────────────────────────────

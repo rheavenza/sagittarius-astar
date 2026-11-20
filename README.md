@@ -24,7 +24,7 @@
 ## Features
 
 ### Core Capabilities
-- 🤖 **Multi-Provider & Model Integration** — Support for Google Gemini (official Go SDK, including `gemini-2.5-flash` (default), `gemini-2.5-pro`, etc.) and DeepSeek (OpenAI-compatible, including `deepseek-v4-flash`, `deepseek-v4-pro`, etc.). Switch providers and models on-the-fly inside the active session.
+- 🤖 **Multi-Provider & Model Integration** — Support for Google Gemini (official Go SDK, including `gemini-2.5-flash` (default), `gemini-2.5-pro`, etc.), DeepSeek (OpenAI-compatible, including `deepseek-v4-flash`, `deepseek-v4-pro`, etc.), and **NVIDIA NIM** (hosted at build.nvidia.com or self-hosted; any model in the catalog, browsable live with `/models`). Switch providers and models on-the-fly inside the active session.
 - 🔌 **Model Context Protocol (MCP) Host** — Dynamic host architecture supporting any stdio transport MCP server. Discovers schemas via `tools/list` on startup, translates them dynamically into LLM function declarations, and runs RPC tool calls asynchronously.
 - 🧠 **Interleaved Reasoning & PAR Loops** — Renders model thinking phases in real-time under a separate, styled deliberating section (Catppuccin subtext, left border, status badge). Dynamically enforces a **Plan-Action-Reflection (PAR)** directive when tools are active to optimize tool-calling ergonomics.
 - ⚡ **Autonomous Tool-Calling Agent Loop** — Runs multi-turn tool loops sequentially to resolve complex tasks (e.g., read file, search, write/edit file, run test command, repeat).
@@ -82,7 +82,7 @@ nix build           # builds the aig package (update vendorHash first)
 
 `aig` resolves settings from the following sources, in order of priority:
 1. CLI Flags (`--provider`, `--model`, `--persona`, etc.)
-2. Environment variables (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`)
+2. Environment variables (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `NVIDIA_API_KEY`, `NIM_BASE_URL`)
 3. JSON Configuration File (`~/.config/aig/config.json`)
 
 On first launch, `aig` generates a default `config.json` at:
@@ -97,6 +97,8 @@ On first launch, `aig` generates a default `config.json` at:
   "default_persona": "coder",
   "gemini_api_key": "YOUR_GEMINI_KEY",
   "deepseek_api_key": "YOUR_DEEPSEEK_KEY",
+  "nvidia_api_key": "nvapi-...",
+  "nim_base_url": "",
   "personas": {
     "reviewer": "Your own persona. Built-ins (default, sysadmin, coder) are always available; entries here override them."
   },
@@ -122,6 +124,12 @@ On first launch, `aig` generates a default `config.json` at:
 5. **Namespacing & approval**: Tools are exposed as `mcp__<server>__<tool>` so they never shadow built-ins. Each call asks for confirmation unless the server has `"trusted": true` or `/approve-tools on` is active.
 6. **Fault isolation**: A server that fails to start or to answer discovery is skipped; its stderr is written to the aig log.
 
+### NVIDIA NIM
+- Provider name `nim` (alias `nvidia`). Uses the OpenAI-compatible API at `https://integrate.api.nvidia.com/v1`, or `nim_base_url` / `NIM_BASE_URL` for a self-hosted NIM (no API key needed then).
+- `/model` and `/models <filter>` fetch the live model list from the endpoint, so new catalog models work without an aig update.
+- Tool calling depends on the model: check its card on build.nvidia.com. Models without tool support may reject requests that include tools.
+- Mid-conversation system messages are folded into user turns, since many open-model chat templates reject them.
+
 ### Per-directory prompt (`./aig.md`)
 If the working directory contains `aig.md`, aig asks once before using it as the system prompt, and remembers the approval (by content hash) in `~/.config/aig/trusted_prompts.json`. If the file changes, aig asks again.
 
@@ -136,6 +144,13 @@ aig
 
 # Specify provider and model
 aig --provider deepseek --model deepseek-v4-pro
+
+# NVIDIA NIM (hosted) — key from https://build.nvidia.com
+export NVIDIA_API_KEY=nvapi-...
+aig --provider nim --model meta/llama-3.3-70b-instruct
+
+# Self-hosted NIM container (no key needed)
+NIM_BASE_URL=http://localhost:8000/v1 aig --provider nim --model <model-id>
 aig -p deepseek -m deepseek-v4-flash
 
 # Use a custom system prompt persona
@@ -163,6 +178,7 @@ aig -r 20260521-170000
 | `/clear` | Clear the viewport display while retaining the system prompt |
 | `/model` | List available models for the current active provider |
 | `/model <id>` | Switch the active model on-the-fly (keeps conversation history) |
+| `/models [filter]` | Pick a model from the provider's live list (NIM fetches its catalog), e.g. `/models qwen` |
 | `/provider` | List available providers |
 | `/provider <name>` | Switch the active provider on-the-fly (keeps conversation history) |
 | `/persona` | List available personas configured |
