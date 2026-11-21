@@ -139,6 +139,9 @@ type ApprovalReply struct {
 	Approved bool
 	Command  string // edited command (ApproveCommand); "" keeps the original
 	Password string // ApproveSudoPassword
+	// Reason, on a denial, replaces the default "the user denied it" tool
+	// result (e.g. headless mode explains that nobody could be asked).
+	Reason string
 }
 
 func newRequest(r *ApprovalRequest) *ApprovalRequest {
@@ -164,4 +167,9 @@ func (r *ApprovalRequest) ProvidePassword(password string) {
 // Deny rejects the request.
 func (r *ApprovalRequest) Deny() {
 	r.send(ApprovalReply{Approved: false})
+}
+
+// DenyWithReason rejects the request; reason is what the model is told.
+func (r *ApprovalRequest) DenyWithReason(reason string) {
+	r.send(ApprovalReply{Approved: false, Reason: reason})
 }

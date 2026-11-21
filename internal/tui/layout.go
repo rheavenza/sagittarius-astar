@@ -77,6 +77,9 @@ func (m Model) idleBox(s string) string {
 func (m Model) inputView() string {
 	switch m.appState {
 	case stateInput:
+		if line := m.mentionLine(); line != "" {
+			return m.activeBox(m.textarea.View() + "\n" + line)
+		}
 		return m.activeBox(m.textarea.View())
 	case stateStreaming:
 		label := "streaming…"

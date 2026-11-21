@@ -135,10 +135,12 @@ func (t *turn) runSub(ctx context.Context) (answer string, rounds, uses int, err
 	}
 }
 
-// describeCall is a one-line summary of a tool call for progress notices.
-func describeCall(c llm.ToolCall) string {
+func describeCall(c llm.ToolCall) string { return DescribeCall(c) }
+
+// DescribeCall is a one-line summary of a tool call for progress output.
+func DescribeCall(c llm.ToolCall) string {
 	arg := ""
-	for _, k := range []string{"path", "pattern", "glob", "dir", "question"} {
+	for _, k := range []string{"command", "path", "pattern", "glob", "dir", "query", "url", "question", "id"} {
 		if v, ok := c.Args[k].(string); ok && v != "" {
 			arg = v
 			break

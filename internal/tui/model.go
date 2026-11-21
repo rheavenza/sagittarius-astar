@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"strings"
 	"time"
 
@@ -31,6 +30,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/config"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
+	"github.com/clitorhea/sagittarius-astar.git/internal/mention"
 	"github.com/clitorhea/sagittarius-astar.git/internal/sandbox"
 	"github.com/clitorhea/sagittarius-astar.git/internal/session"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tools"
@@ -118,6 +118,7 @@ type Model struct {
 	execTimeout        time.Duration
 	autocompletePrefix string
 	autocompleteIdx    int
+	mentions           *mentionState
 
 	// Layout
 	width             int
@@ -203,6 +204,7 @@ func NewModel(ag *agent.Agent, activeSession *session.Session, defaultSystemProm
 	m := &Model{
 		providerFingerprint: endpointFingerprint(providerName, modelName),
 		appState:            stateInput,
+		mentions:            &mentionState{},
 		history:             activeSession.History,
 		agent:               ag,
 		stream:              newStreamState(),
@@ -270,6 +272,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		case stateInput:
 			if msg.Type != tea.KeyTab {
 				m.autocompletePrefix = ""
+				m.resetMentions()
 			}
 			switch msg.Type {
 			case tea.KeyShiftTab:
@@ -282,6 +285,10 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 				m.viewport.GotoTop()
 				return m, nil
 			case tea.KeyTab:
+				if m.completeMention() {
+					m.recalculateDimensions()
+					return m, nil
+				}
 				currentText := m.textarea.Value()
 				if strings.HasPrefix(currentText, "/") {
 					var slashCommands = []string{
@@ -338,8 +345,13 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 					break
 				}
 
-				// Slash Commands
-				if strings.HasPrefix(input, "/") {
+				if m.mentions != nil && len(m.mentions.sugg) > 0 {
+					m.mentions.sugg = nil
+					defer m.recalculateDimensions()
+				}
+
+				// Slash Commands (/read(file) is the old mention syntax)
+				if strings.HasPrefix(input, "/") && !strings.HasPrefix(input, "/read(") {
 					m.textarea.Reset()
 
 					// Exit commands
@@ -397,7 +409,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						m.appendOutput("  PgUp/PgDn, wheel   Scroll the conversation (Ctrl+Home / Ctrl+End: top / bottom)")
 						m.appendOutput("  Ctrl+L             Clear viewport")
 						m.appendOutput("  ?                  Toggle this help overlay")
-						m.appendOutput("  /read(file)        Attach file content to next message")
+						m.appendOutput("  @path, @path:10-40  Attach a file, line range or directory (Tab completes)")
 						m.refreshViewport()
 						break
 					}
@@ -920,6 +932,9 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		var taCmd tea.Cmd
 		m.textarea, taCmd = m.textarea.Update(msg)
 		cmds = append(cmds, taCmd)
+		if _, ok := msg.(tea.KeyMsg); ok && m.updateMentions() {
+			m.recalculateDimensions()
+		}
 	} else if m.appState == stateInputSudoPassword {
 		var tiCmd tea.Cmd
 		m.sudoTextInput, tiCmd = m.sudoTextInput.Update(msg)
@@ -1043,7 +1058,7 @@ func (m Model) generateSessionTitleCmd() tea.Cmd {
 	var userQuery string
 	for _, msg := range m.history {
 		if msg.Role == llm.RoleUser {
-			userQuery = msg.Content
+			userQuery, _ = mention.Split(msg.Content) // not the attached files
 			break
 		}
 	}
@@ -1151,12 +1166,16 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 			continue
 		}
 		if msg.Role == llm.RoleUser {
+			text, attached := mention.Split(msg.Content)
 			label := userLabelStyle.Render("You")
 			m.outputLines = append(m.outputLines,
 				label,
-				lipgloss.NewStyle().Foreground(colorText).Render(msg.Content),
-				m.convDivider(),
+				lipgloss.NewStyle().Foreground(colorText).Render(text),
 			)
+			for _, p := range attached {
+				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorSubtext).Render("📎 "+p))
+			}
+			m.outputLines = append(m.outputLines, m.convDivider())
 		} else if msg.Role == llm.RoleAssistant {
 			if msg.Content != "" || msg.ReasoningContent != "" {
 				label := assistantLabelStyle.Render("aig")
@@ -1279,26 +1298,11 @@ func (m *Model) saveSession() {
 // submitPrompt adds the user's message to history and renders it in the viewport.
 func (m Model) submitPrompt(input string) Model {
 	m.stickBottom = true
-	// 1. Process /read(file) macros
-	reRead := regexp.MustCompile(`\/read\(([^)]+)\)`)
-	matches := reRead.FindAllStringSubmatch(input, -1)
-	for _, match := range matches {
-		filename := match[1]
-		content, err := os.ReadFile(filename)
-		if err != nil {
-			m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ Could not read %s: %v", filename, err)))
-		} else {
-			m.history = append(m.history, llm.Message{
-				Role:    llm.RoleSystem,
-				Content: fmt.Sprintf("File Context: %s\n```\n%s\n```", filename, string(content)),
-			})
-			m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(fmt.Sprintf("📎 Attached %s", filename)))
-		}
-	}
-
+	cwd, _ := os.Getwd()
+	content, atts := mention.Expand(input, cwd)
 	m.history = append(m.history, llm.Message{
 		Role:    llm.RoleUser,
-		Content: input,
+		Content: content,
 	})
 	m.saveSession()
 
@@ -1306,8 +1310,15 @@ func (m Model) submitPrompt(input string) Model {
 	m.outputLines = append(m.outputLines,
 		label,
 		lipgloss.NewStyle().Foreground(colorText).Render(input),
-		m.convDivider(),
 	)
+	for _, a := range atts {
+		if a.Err != nil {
+			m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Render("⚠ "+a.Label()))
+		} else {
+			m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorSubtext).Render("📎 "+a.Label()))
+		}
+	}
+	m.outputLines = append(m.outputLines, m.convDivider())
 	return m
 }
 
@@ -1385,8 +1396,8 @@ func helpOverlay() string {
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  Project index"),
 		"  /summarize          Preview; /summarize go builds the project summary",
 		"  /compact            Summarize older turns to free context",
-		lipgloss.NewStyle().Foreground(colorAccent).Render("  File macros"),
-		"  /read(path)     Attach file content to next message",
+		lipgloss.NewStyle().Foreground(colorAccent).Render("  Files"),
+		"  @path           Attach a file / dir (@f.go:10-40 a range); Tab completes",
 	}
 	return strings.Join(lines, "\n")
 }

@@ -3,6 +3,8 @@
 // Usage:
 //
 //	aig [flags]
+//	aig -p "explain internal/agent"        # headless: answer on stdout
+//	git diff | aig -p "write a commit message"
 //	aig --provider gemini --model gemini-2.0-flash
 //	aig --provider deepseek --model deepseek-chat
 //	aig --provider nim --model meta/llama-3.3-70b-instruct
@@ -24,6 +26,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/agent"
@@ -48,11 +51,19 @@ var (
 	flagLogLevel string
 	flagLogFile  string
 
+	flagPrint          bool
+	flagOutputFormat   string
+	flagQuiet          bool
+	flagPermissionMode string
+
 	version = "dev" // Injected by LDFLAGS during build
 )
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
+		if code, ok := exitCode(err); ok {
+			os.Exit(code)
+		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -69,18 +80,27 @@ Configuration file is located at: ~/.config/aig/config.json
 Sessions are saved to: ~/.local/share/aig/sessions/
 Logs are written to: ~/.cache/aig/aig.log
 
+Headless mode (-p) runs one prompt without the TUI and prints the answer
+on stdout. Piped stdin is attached to the prompt. Calls that need approval
+in the permission mode are denied, since nobody can be asked.
+
 Examples:
   aig
+  aig -p "where is the retry logic?"
+  git diff --staged | aig -p "write a commit message"
+  aig -p --permission-mode accept-edits "fix the failing test"
+  aig -p --output-format json "summarize README.md" | jq -r .result
+  aig -r -p "continue"                  # follow up on the latest session
   aig --provider deepseek
   aig --provider nim --model meta/llama-3.3-70b-instruct   # NVIDIA_API_KEY
   aig --persona sysadmin
   aig --resume 20260521-170000
   aig --log-level debug
   aig --version`,
-	// aig takes no positional arguments. Without this, a typo or an unknown
-	// subcommand (e.g. "aig foo") silently started the full TUI.
-	Args: cobra.NoArgs,
-	RunE: runChat,
+	// Positional arguments are only the -p prompt; runRoot rejects them
+	// otherwise, so a typo or unknown subcommand doesn't start the TUI.
+	Args: cobra.ArbitraryArgs,
+	RunE: runRoot,
 	// Runtime errors are printed once by main(); usage only for flag errors.
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -101,8 +121,24 @@ var versionCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.PersistentFlags().StringVarP(
-		&flagProvider, "provider", "p", "",
+		&flagProvider, "provider", "P", "",
 		"LLM provider to use (gemini | deepseek | nim)",
+	)
+	rootCmd.Flags().BoolVarP(
+		&flagPrint, "print", "p", false,
+		"Headless: run the prompt given as arguments (and/or piped stdin), print the answer and exit",
+	)
+	rootCmd.Flags().StringVar(
+		&flagOutputFormat, "output-format", "text",
+		"With -p: text | json (one result object) | stream-json (one event per line)",
+	)
+	rootCmd.Flags().BoolVarP(
+		&flagQuiet, "quiet", "q", false,
+		"With -p: don't show tool activity, denials or consent notices on stderr",
+	)
+	rootCmd.PersistentFlags().StringVar(
+		&flagPermissionMode, "permission-mode", "",
+		"default | accept-edits | auto | plan (overrides permission_mode in config)",
 	)
 	rootCmd.PersistentFlags().StringVarP(
 		&flagModel, "model", "m", "",
@@ -127,25 +163,91 @@ func init() {
 	)
 }
 
-func runChat(_ *cobra.Command, _ []string) error {
+// runRoot starts the TUI, or runs one prompt headless with -p.
+func runRoot(cmd *cobra.Command, args []string) error {
+	if flagPrint {
+		return runHeadless(cmd, args)
+	}
+	if len(args) > 0 {
+		return fmt.Errorf("unexpected argument %q (to run a prompt without the TUI: aig -p %q)", args[0], strings.Join(args, " "))
+	}
+	if flagOutputFormat != "text" || flagQuiet {
+		return fmt.Errorf("--output-format and --quiet only apply with -p")
+	}
 	// The TUI needs a real terminal. Without one (e.g. when aig itself is
 	// run by an agent's shell tool) it would hang until killed.
 	if !isTerminal(os.Stdin) || !isTerminal(os.Stdout) {
-		return fmt.Errorf("aig needs an interactive terminal (stdin and stdout must be a TTY); use 'aig --version' or 'aig --help' from scripts")
+		return fmt.Errorf("aig needs an interactive terminal (stdin and stdout must be a TTY); use 'aig -p \"prompt\"' from scripts")
 	}
 
-	// ── Logging ──────────────────────────────────────────────────────────────
-	logLevel, err := logger.ParseLevel(flagLogLevel)
+	rt, err := setup()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: %v — defaulting to info\n", err)
+		return err
+	}
+	defer rt.close()
+
+	// ── TUI ─────────────────────────────────────────────────────────────────────────────────
+	model, err := tui.NewModel(rt.agent, rt.session, rt.cfg.SystemPrompt, version, string(rt.cfg.Provider), rt.cfg.Model, rt.cfg.Persona)
+	if err != nil {
+		logger.L.Error("TUI init failed", "error", err)
+		return fmt.Errorf("failed to initialize TUI: %w", err)
+	}
+	model.SetCheckpoints(rt.checkpoints)
+
+	p := tea.NewProgram(
+		model,
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	)
+
+	logger.L.Debug("entering TUI event loop")
+	if _, err := p.Run(); err != nil {
+		logger.L.Error("TUI exited with error", "error", err)
+		return fmt.Errorf("TUI error: %w", err)
+	}
+
+	logger.L.Info("aig exited cleanly")
+	return nil
+}
+
+// runtime is everything a front-end (TUI or headless) needs.
+type runtime struct {
+	cfg         *config.Config
+	session     *session.Session
+	provider    llm.Provider
+	agent       *agent.Agent
+	checkpoints *checkpoint.Manager
+	closers     []func()
+}
+
+func (r *runtime) close() {
+	for i := len(r.closers) - 1; i >= 0; i-- {
+		r.closers[i]()
+	}
+}
+
+// setup loads logging, config, the session, the provider, MCP servers and
+// the agent. The caller must call close on success.
+func setup() (_ *runtime, err error) {
+	rt := &runtime{}
+	defer func() {
+		if err != nil {
+			rt.close() // error returns are (nil, err): close what was opened
+		}
+	}()
+
+	// ── Logging ──────────────────────────────────────────────────────────────
+	logLevel, lerr := logger.ParseLevel(flagLogLevel)
+	if lerr != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v — defaulting to info\n", lerr)
 		logLevel = slog.LevelInfo
 	}
 
-	cleanupLog, err := logger.Init(logLevel, flagLogFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: logging disabled: %v\n", err)
+	cleanupLog, lerr := logger.Init(logLevel, flagLogFile)
+	if lerr != nil {
+		fmt.Fprintf(os.Stderr, "warning: logging disabled: %v\n", lerr)
 	}
-	defer cleanupLog()
+	rt.closers = append(rt.closers, cleanupLog)
 
 	// Build the repo map in the background while config, consent prompts
 	// and MCP servers start up.
@@ -160,7 +262,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 	cfg, err := config.Load(config.ProviderName(flagProvider), flagModel, flagPersona)
 	if err != nil {
 		logger.L.Error("config load failed", "error", err)
-		return fmt.Errorf("configuration error: %w\n\nRun 'aig --help' for usage", err)
+		return nil, fmt.Errorf("configuration error: %w\n\nRun 'aig --help' for usage", err)
 	}
 
 	// ── Session Resolution ───────────────────────────────────────────────────
@@ -170,13 +272,13 @@ func runChat(_ *cobra.Command, _ []string) error {
 			activeSession, err = session.LoadLatest()
 			if err != nil {
 				logger.L.Error("failed to load latest session", "error", err)
-				return fmt.Errorf("failed to resume latest session: %w", err)
+				return nil, fmt.Errorf("failed to resume latest session: %w", err)
 			}
 		} else {
 			activeSession, err = session.Load(flagResume)
 			if err != nil {
 				logger.L.Error("failed to load session to resume", "id", flagResume, "error", err)
-				return fmt.Errorf("failed to resume session %q: %w", flagResume, err)
+				return nil, fmt.Errorf("failed to resume session %q: %w", flagResume, err)
 			}
 		}
 		logger.L.Info("resuming session", "id", activeSession.ID, "turns", len(activeSession.History))
@@ -192,7 +294,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 		cfg, err = config.Load(config.ProviderName(flagProvider), flagModel, flagPersona)
 		if err != nil {
 			logger.L.Error("config reload failed for resumed session", "error", err)
-			return fmt.Errorf("configuration error: %w", err)
+			return nil, fmt.Errorf("configuration error: %w", err)
 		}
 	} else {
 		activeSession = &session.Session{
@@ -223,7 +325,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 	provider, err := llm.NewProvider(string(cfg.Provider), cfg.APIKey, cfg.Model, cfg.BaseURL)
 	if err != nil {
 		logger.L.Error("provider init failed", "provider", cfg.Provider, "error", err)
-		return fmt.Errorf("failed to initialize provider: %w", err)
+		return nil, fmt.Errorf("failed to initialize provider: %w", err)
 	}
 	logger.L.Debug("provider initialised", "provider", cfg.Provider, "model", cfg.Model)
 
@@ -269,12 +371,12 @@ func runChat(_ *cobra.Command, _ []string) error {
 					"tools", mcpRegistry.ToolCount(),
 				)
 				// Shut down registry clients before the manager closes the pipes.
-				defer func() {
+				rt.closers = append(rt.closers, func() {
 					mcpRegistry.Shutdown()
 					shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer shutCancel()
 					mcpMgr.Shutdown(shutCtx)
-				}()
+				})
 			}
 		}
 	} else {
@@ -297,38 +399,30 @@ func runChat(_ *cobra.Command, _ []string) error {
 		ProjectChecks:  projectChecks,
 	})
 
-	if fc.PermissionMode != "" {
-		if strings.EqualFold(fc.PermissionMode, "plan") {
+	if pm := firstNonEmpty(flagPermissionMode, fc.PermissionMode); pm != "" {
+		if strings.EqualFold(pm, "plan") {
 			ag.SetPlanMode(true)
-		} else if mode, ok := agent.ParseMode(fc.PermissionMode); ok {
+		} else if mode, ok := agent.ParseMode(pm); ok {
 			ag.SetMode(mode)
+		} else if flagPermissionMode != "" {
+			return nil, fmt.Errorf("unknown --permission-mode %q (default | accept-edits | auto | plan)", pm)
 		} else {
-			logger.L.Warn("unknown permission_mode in config, using default", "value", fc.PermissionMode)
+			logger.L.Warn("unknown permission_mode in config, using default", "value", pm)
 		}
 	}
+	ag.SetContextWindow(llm.ContextWindow(cfg.Model, fc.ContextWindows))
 
-	// ── TUI ─────────────────────────────────────────────────────────────────────────────────
-	model, err := tui.NewModel(ag, activeSession, cfg.SystemPrompt, version, string(cfg.Provider), cfg.Model, cfg.Persona)
-	if err != nil {
-		logger.L.Error("TUI init failed", "error", err)
-		return fmt.Errorf("failed to initialize TUI: %w", err)
+	rt.cfg, rt.session, rt.provider, rt.agent, rt.checkpoints = cfg, activeSession, provider, ag, checkpoints
+	return rt, nil
+}
+
+func firstNonEmpty(s ...string) string {
+	for _, v := range s {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
 	}
-	model.SetCheckpoints(checkpoints)
-
-	p := tea.NewProgram(
-		model,
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
-	)
-
-	logger.L.Debug("entering TUI event loop")
-	if _, err := p.Run(); err != nil {
-		logger.L.Error("TUI exited with error", "error", err)
-		return fmt.Errorf("TUI error: %w", err)
-	}
-
-	logger.L.Info("aig exited cleanly")
-	return nil
+	return ""
 }
 
 // resolveLocalPrompt returns "aig.md" if a ./aig.md exists and the user has
@@ -479,8 +573,11 @@ func askTrust(path, effect string) bool {
 		return true
 	}
 	// Only ask when we can actually talk to a human.
-	if st, err := os.Stdin.Stat(); err != nil || st.Mode()&os.ModeCharDevice == 0 {
+	if !isTerminal(os.Stdin) || !isTerminal(os.Stderr) {
 		logger.L.Warn("ignoring untrusted prompt file (no terminal to ask for consent)", "path", path)
+		if !flagQuiet {
+			fmt.Fprintf(os.Stderr, "aig: not using %s: it isn't approved yet (start aig in a terminal once to review it)\n", path)
+		}
 		return false
 	}
 
@@ -507,8 +604,7 @@ func askTrust(path, effect string) bool {
 // stdinReader is shared so consecutive prompts don't lose buffered input.
 var stdinReader = bufio.NewReader(os.Stdin)
 
-// isTerminal reports whether f is a character device (a TTY).
+// isTerminal reports whether f is a terminal (not /dev/null or a pipe).
 func isTerminal(f *os.File) bool {
-	st, err := f.Stat()
-	return err == nil && st.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(f.Fd())
 }

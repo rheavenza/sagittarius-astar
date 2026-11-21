@@ -227,7 +227,7 @@ aig --provider nim --model meta/llama-3.3-70b-instruct
 
 # Self-hosted NIM container (no key needed)
 NIM_BASE_URL=http://localhost:8000/v1 aig --provider nim --model <model-id>
-aig -p deepseek -m deepseek-v4-flash
+aig -P deepseek -m deepseek-v4-flash      # -P is --provider (-p is headless mode)
 
 # Use a custom system prompt persona
 aig --persona sysadmin
@@ -240,6 +240,33 @@ aig --resume
 # Resume a specific conversation by ID
 aig -r 20260521-170000
 ```
+
+### Headless mode (`-p`)
+
+`aig -p` runs one prompt without the TUI: the final answer goes to stdout,
+tool activity and warnings to stderr, so it composes in pipes and scripts.
+Piped stdin is attached to the prompt (or is the prompt, if none is given).
+
+```bash
+aig -p "where is the retry logic?"
+git diff --staged | aig -p "write a commit message" | git commit -F -
+aig -p --permission-mode accept-edits "fix the failing test"
+aig -p --output-format json "summarize README.md" | jq -r .result
+aig -p --output-format stream-json "…"   # one JSON event per line
+aig -r -p "and now the tests"            # continue the latest session
+```
+
+- Nobody can approve anything, so calls that need approval in the permission
+  mode are **denied** and the model is told why (destructive commands are
+  still denied in `auto`). Choose the mode with `--permission-mode`.
+- Untrusted `AGENTS.md` / `.aig/config.json` / `aig.md` are skipped without a
+  terminal to ask; approve them once in the TUI.
+- Every run is saved as a session (`aig -r` resumes it in the TUI or with `-p`).
+- `--output-format json` prints one object: `result`, `is_error`, `error`,
+  `session_id`, `usage` (summed over requests), `requests`, `tool_calls`,
+  `denied`, `duration_ms`.
+- Exit codes: `0` success, `1` error (provider failure, tool-round limit),
+  `130` interrupted. `-q` hides tool activity and notices.
 
 ### In-session commands
 
@@ -271,20 +298,37 @@ aig -r 20260521-170000
 | `Enter` | Send message |
 | `Shift+Enter` | Insert a newline in the text area |
 
-### Inline Macros
+### `@file` mentions
 
-- **`/read(path)`**: Attach the content of a file located at `path` directly to the next message context. You can include multiple `/read(...)` macros in a single input message. E.g., `Refactor /read(internal/tui/styles.go) to use Catppuccin theme.`
+Mention files in a message to attach them — in the TUI and with `aig -p`:
+
+```
+explain @internal/agent/agent.go
+compare @a.go:10-40 with @"dir with space/b.go"
+what's in @internal/tools/ ?
+```
+
+- `@path` attaches the file (up to 100 KB; longer files are cut with a note
+  telling the model to `read_file` the rest), `@path:10-40` a line range,
+  `@dir/` a directory listing. At most 400 KB per message.
+- Type `@` and press **Tab** to complete from the workspace's files (fuzzy;
+  Tab again cycles). Suggestions show under the input.
+- Mentions that don't name a file (`@alice`, e-mail addresses) are left
+  alone; a path-like mention that doesn't exist is flagged with ⚠.
+- The transcript shows `📎 path (N lines)`; the content goes to the model
+  only. The old `/read(path)` macro still works and means `@path`.
 
 ---
 
 ## Architecture
 
 ```
-cmd/aig            CLI entry: config, MCP bootstrap, context block, agent + TUI wiring
+cmd/aig            CLI entry: config, MCP bootstrap, context block, agent + TUI / headless (-p) wiring
 internal/agent     the agent loop (UI-independent) → event stream + approval requests
 internal/tools     native tools, edit matching, post-edit checks, risk levels
 internal/tui       Bubble Tea front-end: renders events, answers approvals
 internal/llm       providers (Gemini, OpenAI-compatible DeepSeek / NVIDIA NIM), pruning, <think> splitting
+internal/mention   @file mentions: attachment blocks, path completion
 internal/prompt    environment block + AGENTS.md / CLAUDE.md instructions
 internal/repomap   repository map: Go via go/parser, Python/JS/TS/Rust/shell via line patterns, reference ranking
 internal/sandbox   command execution (process groups, output caps, askpass sudo)

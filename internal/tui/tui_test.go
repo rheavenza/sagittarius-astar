@@ -566,3 +566,62 @@ func TestStatusBarShowsContextUse(t *testing.T) {
 		t.Errorf("estimated usage not marked: %q", bar)
 	}
 }
+
+func TestTUIMentionCompletionAndAttach(t *testing.T) {
+	d := newDriver(t, &fakeProvider{replies: []scripted{{tokens: []string{"ok"}}}})
+	os.MkdirAll("internal/agent", 0o755)
+	os.WriteFile("internal/agent/agent.go", []byte("package agent\n"), 0o644)
+	os.WriteFile("internal/agent/explore.go", []byte("package agent\n"), 0o644)
+	os.WriteFile("notes.txt", []byte("remember the milk\n"), 0o644)
+
+	typeText := func(s string) {
+		for _, r := range s {
+			d.send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		}
+	}
+	typeText("explain @int")
+	frame := reANSI.ReplaceAllString(d.m.View(), "")
+	if !strings.Contains(frame, "@ Tab:") || !strings.Contains(frame, "internal/") {
+		t.Fatalf("no suggestions shown:\n%s", frame)
+	}
+	if len(frameLines(d.m)) > 40 {
+		t.Fatal("suggestion line pushed the frame past the terminal height")
+	}
+	d.key(tea.KeyTab)
+	if got := d.m.textarea.Value(); got != "explain @internal/" {
+		t.Fatalf("after Tab: %q", got)
+	}
+	typeText("e")
+	d.key(tea.KeyTab)
+	first := d.m.textarea.Value()
+	d.key(tea.KeyTab)
+	second := d.m.textarea.Value()
+	if first == second || !strings.HasPrefix(first, "explain @internal/") || !strings.HasPrefix(second, "explain @internal/") {
+		t.Fatalf("Tab should cycle: %q then %q", first, second)
+	}
+
+	d.m.textarea.SetValue("what is in @notes.txt?")
+	d.key(tea.KeyEnter)
+	d.runUntil("turn done", idle)
+	var user string
+	for _, m := range d.m.history {
+		if m.Role == llm.RoleUser {
+			user = m.Content
+		}
+	}
+	if !strings.HasPrefix(user, "what is in @notes.txt?\n\n<file path=\"notes.txt\">\nremember the milk\n</file>") {
+		t.Fatalf("attachment missing from the user message: %q", user)
+	}
+	if out := output(d.m); !strings.Contains(out, "📎 notes.txt (1 line)") || strings.Contains(out, "remember the milk") {
+		t.Fatalf("transcript should list the attachment, not its content:\n%s", out)
+	}
+	if d.m.mentions.sugg != nil {
+		t.Fatal("suggestions not cleared on submit")
+	}
+
+	// A reloaded session shows the attachment as a 📎 line too.
+	d.m.loadHistory(d.m.history, false)
+	if out := output(d.m); !strings.Contains(out, "📎 notes.txt") || strings.Contains(out, "remember the milk") {
+		t.Fatalf("reloaded transcript:\n%s", out)
+	}
+}

@@ -143,8 +143,15 @@ Prerequisite for headless mode, subagents and proper tests.
   per-request pruning, which changed the prefix every time, rarely kicks in.
 
 ## Phase 7 — Workflow & UX ⬜
-- ⬜ Headless mode: `aig -p "…"`, stdin piping (`git diff | aig -p "commit message"`).
-- ⬜ `@file` mentions with autocomplete (replaces `/read(file)`).
+- ✅ Headless mode: `aig -p "…"`, stdin piping (`git diff | aig -p "commit message"`).
+  Answer on stdout, activity on stderr; `--output-format text|json|stream-json`;
+  `--permission-mode`; approvals are denied with an explanation to the model;
+  runs are saved as sessions (`aig -r -p`); exit codes 0/1/130.
+  `--provider`'s short flag moved from `-p` to `-P`.
+- ✅ `@file` mentions with autocomplete (replaces `/read(file)`).
+  `@path`, `@path:10-40`, `@dir/`, `@"quoted path"`; attached to the user
+  message (100 KB/file, 400 KB/message); fuzzy Tab completion with a
+  suggestion line; works in `aig -p` too; `/read(x)` still accepted.
 - ⬜ Token/cost meter, session search.
 - ⬜ Real isolation for commands (bubblewrap / Landlock / distrobox).
 - ⬜ Proper search API (SearXNG / Brave), HTML → markdown, parallel read-only tools.

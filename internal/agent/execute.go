@@ -31,6 +31,14 @@ func (o outcome) content() string {
 
 func deniedOutcome(msg string) outcome { return outcome{result: msg, denied: true} }
 
+// deniedBy is deniedOutcome with the front-end's reason, if it gave one.
+func deniedBy(rep ApprovalReply, msg string) outcome {
+	if rep.Reason != "" {
+		msg = rep.Reason
+	}
+	return deniedOutcome(msg)
+}
+
 const deniedToolMsg = "The user denied this tool call. Do not retry it without asking the user."
 
 // ask emits an approval request and waits for the answer (or cancellation).
@@ -71,8 +79,8 @@ func (t *turn) execute(ctx context.Context, call llm.ToolCall) outcome {
 		asked := !auto && !a.mcp.IsTrusted(call.Name)
 		if asked {
 			req := newRequest(&ApprovalRequest{Kind: ApproveTool, Call: call, Title: "MCP tool " + call.Name, Risk: tools.RiskExternal})
-			if _, ok := t.ask(ctx, req); !ok {
-				return deniedOutcome(deniedToolMsg)
+			if rep, ok := t.ask(ctx, req); !ok {
+				return deniedBy(rep, deniedToolMsg)
 			}
 		}
 		t.ensureCheckpoint()
@@ -117,8 +125,8 @@ func (t *turn) execute(ctx context.Context, call llm.ToolCall) outcome {
 		if need, reason := tools.NeedsApproval(call, a.workspaceRoot); need {
 			asked = true
 			req := newRequest(&ApprovalRequest{Kind: ApproveTool, Call: call, Title: call.Name + " — " + reason, Risk: risk})
-			if _, ok := t.ask(ctx, req); !ok {
-				return deniedOutcome(deniedToolMsg)
+			if rep, ok := t.ask(ctx, req); !ok {
+				return deniedBy(rep, deniedToolMsg)
 			}
 		}
 	}
@@ -147,8 +155,8 @@ func (t *turn) write(ctx context.Context, call llm.ToolCall) outcome {
 			title += " (outside the workspace)"
 		}
 		req := newRequest(&ApprovalRequest{Kind: ApproveWrite, Call: call, Title: title, Write: pw, Risk: tools.RiskWrite})
-		if _, ok := t.ask(ctx, req); !ok {
-			return deniedOutcome("The user rejected this file change. Do not retry it without asking the user.")
+		if rep, ok := t.ask(ctx, req); !ok {
+			return deniedBy(rep, "The user rejected this file change. Do not retry it without asking the user.")
 		}
 	}
 
@@ -191,7 +199,7 @@ func (t *turn) runCommand(ctx context.Context, call llm.ToolCall, auto bool) out
 		req := newRequest(&ApprovalRequest{Kind: ApproveCommand, Call: call, Title: title, Command: command, Risk: tools.RiskExec})
 		rep, ok := t.ask(ctx, req)
 		if !ok {
-			return deniedOutcome("Command skipped by user.")
+			return deniedBy(rep, "Command skipped by user.")
 		}
 		if c := strings.TrimSpace(rep.Command); c != "" {
 			command = c
@@ -205,7 +213,7 @@ func (t *turn) runCommand(ctx context.Context, call llm.ToolCall, auto bool) out
 			req := newRequest(&ApprovalRequest{Kind: ApproveSudoPassword, Call: call, Title: "sudo password", Command: command, Risk: tools.RiskExec})
 			rep, ok := t.ask(ctx, req)
 			if !ok {
-				return deniedOutcome("Command cancelled by user (sudo password not provided).")
+				return deniedBy(rep, "Command cancelled by user (sudo password not provided).")
 			}
 			password = rep.Password
 			a.setSudoPassword(password)
@@ -278,8 +286,8 @@ func (t *turn) runChecks(ctx context.Context, call llm.ToolCall, auto bool) outc
 	}
 	if !auto {
 		req := newRequest(&ApprovalRequest{Kind: ApproveTool, Call: call, Title: title, Command: strings.Join(lines, "\n"), Risk: tools.RiskExec})
-		if _, ok := t.ask(ctx, req); !ok {
-			return deniedOutcome("Checks skipped by user.")
+		if rep, ok := t.ask(ctx, req); !ok {
+			return deniedBy(rep, "Checks skipped by user.")
 		}
 	}
 
