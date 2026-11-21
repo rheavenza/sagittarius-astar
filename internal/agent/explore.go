@@ -35,9 +35,9 @@ const exploreLimitMsg = "You have reached the exploration limit. Do not call mor
 
 // exploreDefs are the tools an explore subagent may use: local read-only
 // tools, without explore itself (no recursion).
-func exploreDefs() []llm.Tool {
+func (a *Agent) exploreDefs() []llm.Tool {
 	var out []llm.Tool
-	for _, d := range tools.Definitions() {
+	for _, d := range append(tools.Definitions(), a.indexDefs()...) {
 		if r, ok := tools.RiskOf(d.Name); ok && r == tools.RiskRead && d.Name != "explore" {
 			out = append(out, d)
 		}
@@ -70,7 +70,7 @@ func (t *turn) explore(ctx context.Context, call llm.ToolCall) outcome {
 		},
 		ch:       ch,
 		sub:      true,
-		toolDefs: exploreDefs(),
+		toolDefs: t.a.exploreDefs(),
 	}
 
 	type result struct {

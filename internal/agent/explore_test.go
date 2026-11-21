@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
+	"github.com/clitorhea/sagittarius-astar.git/internal/summary"
 )
 
 func exploreCall(q string) llm.ToolCall {
@@ -22,10 +23,10 @@ func TestExploreReturnsSubagentAnswer(t *testing.T) {
 	os.WriteFile(f, []byte("package x\n\nfunc Login() {}\n"), 0o644)
 
 	p := &fakeProvider{replies: []reply{
-		{calls: []llm.ToolCall{exploreCall("where is login?")}},                                    // main
+		{calls: []llm.ToolCall{exploreCall("where is login?")}},                                 // main
 		{calls: []llm.ToolCall{{ID: "s1", Name: "read_file", Args: map[string]any{"path": f}}}}, // sub
-		{tokens: []string{"Login is at auth.go:3."}},                                             // sub answer
-		{tokens: []string{"It's in auth.go."}},                                                   // main answer
+		{tokens: []string{"Login is at auth.go:3."}},                                            // sub answer
+		{tokens: []string{"It's in auth.go."}},                                                  // main answer
 	}}
 	a := New(Options{Provider: p, WorkspaceRoot: dir, ContextBlock: "# Environment\n- x"})
 	evs, msgs := collect(t, a.Run(context.Background(), user("find login")), func(r *ApprovalRequest) {
@@ -185,4 +186,30 @@ func TestExploreCancel(t *testing.T) {
 		t.Fatalf("last event = %#v", last)
 	}
 	assertAllCallsAnswered(t, msgs)
+}
+
+func TestProjectOverviewOfferedOnlyWithIndex(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0o644)
+
+	offered := func() bool {
+		p := &fakeProvider{replies: []reply{{tokens: []string{"ok"}}}}
+		a := New(Options{Provider: p, WorkspaceRoot: root})
+		collect(t, a.Run(context.Background(), user("hi")), nil)
+		return slices.Contains(p.toolSets[0], "project_overview")
+	}
+	if offered() {
+		t.Fatal("offered without an index")
+	}
+	plan, err := summary.Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.Run(context.Background(), &fakeProvider{replies: []reply{{tokens: []string{"file"}}, {tokens: []string{"project"}}}}, "m", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !offered() {
+		t.Error("not offered once the index exists")
+	}
 }

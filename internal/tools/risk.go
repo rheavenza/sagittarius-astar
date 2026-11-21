@@ -36,21 +36,22 @@ func (r Risk) String() string {
 
 // nativeRisk maps each native tool to its risk level.
 var nativeRisk = map[string]Risk{
-	"read_file":      RiskRead,
-	"list_directory": RiskRead,
-	"search_regex":   RiskRead,
-	"find_files":     RiskRead,
-	"map_workspace":  RiskRead,
-	"repo_map":       RiskRead,
-	"explore":        RiskRead, // a subagent limited to RiskRead tools
-	"web_search":     RiskNetwork,
-	"web_fetch":      RiskNetwork,
-	"web_scrape":     RiskNetwork,
-	"write_file":     RiskWrite,
-	"edit_file":      RiskWrite,
-	"multi_edit":     RiskWrite,
-	"run_command":    RiskExec,
-	"run_checks":     RiskExec,
+	"read_file":        RiskRead,
+	"list_directory":   RiskRead,
+	"search_regex":     RiskRead,
+	"find_files":       RiskRead,
+	"map_workspace":    RiskRead,
+	"repo_map":         RiskRead,
+	"project_overview": RiskRead,
+	"explore":          RiskRead, // a subagent limited to RiskRead tools
+	"web_search":       RiskNetwork,
+	"web_fetch":        RiskNetwork,
+	"web_scrape":       RiskNetwork,
+	"write_file":       RiskWrite,
+	"edit_file":        RiskWrite,
+	"multi_edit":       RiskWrite,
+	"run_command":      RiskExec,
+	"run_checks":       RiskExec,
 }
 
 // RiskOf returns the risk of a native tool, and whether the name is a native tool.

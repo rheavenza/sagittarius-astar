@@ -124,6 +124,16 @@ func RenderChecks(source string, checks []Check) string {
 	return b.String()
 }
 
+// RenderOverview wraps a /summarize project overview for the system prompt.
+func RenderOverview(date, overview string) string {
+	if strings.TrimSpace(overview) == "" {
+		return ""
+	}
+	return "# Project overview\n" +
+		"Written by a model when the user ran /summarize on " + date + "; it may be outdated, so verify in the code. " +
+		"project_overview has per-directory and per-file summaries.\n\n" + strings.TrimSpace(overview) + "\n"
+}
+
 // RenderRepoMap wraps a rendered repository map for the system prompt.
 func RenderRepoMap(root, repoMap string) string {
 	if strings.TrimSpace(repoMap) == "" {

@@ -99,6 +99,7 @@ type Model struct {
 
 	// checkpoints backs /undo, /redo, /diff (nil if unavailable).
 	checkpoints *checkpoint.Manager
+	summary     *summaryJob // running /summarize, or nil
 
 	// providerFingerprint is provider|model|baseURL|apiKey of the live
 	// provider, so the client is only rebuilt when one of those changes.
@@ -299,6 +300,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						"/provider",
 						"/quit",
 						"/redo",
+						"/summarize",
 						"/undo",
 					}
 
@@ -378,6 +380,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						m.appendOutput("  /checkpoints       List workspace checkpoints")
 						m.appendOutput("  /plan [task]       Plan mode: read-only investigation, then a plan (/plan off to exit)")
 						m.appendOutput("  /go                Approve the plan and implement it")
+						m.appendOutput("  /summarize [go|stop|show]  Cached project summary (preview cost, run, cancel, view)")
 						m.appendOutput("  /quit, /q          Exit the application")
 						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Keyboard shortcuts:"))
 						m.appendOutput("  Enter              Send message")
@@ -719,6 +722,10 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						break
 					}
 
+					if nm, cmd, ok := m.handleSummarizeCommand(input); ok {
+						return nm, cmd
+					}
+
 					// Safety net: /undo /redo /diff /checkpoints /plan /go
 					if nm, cmd, ok := m.handleSafetyCommand(input); ok {
 						return nm, cmd
@@ -864,6 +871,9 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 	// ── Agent turn events ──────────────────────────────────────────────────
 	case agentEventMsg:
 		return m.handleAgentEvent(msg)
+
+	case summaryProgressMsg, summaryDoneMsg:
+		return m.handleSummaryMsg(msg)
 
 	case agentClosedMsg:
 		// The channel closes right after DoneEvent; nothing else to do unless
@@ -1351,6 +1361,8 @@ func helpOverlay() string {
 		"  /diff               Changes since the session's first checkpoint",
 		"  /checkpoints        List checkpoints",
 		"  /plan [task]        Plan mode (read-only), then /go to implement",
+		lipgloss.NewStyle().Foreground(colorAccent).Render("  Project index"),
+		"  /summarize          Preview; /summarize go builds the project summary",
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  File macros"),
 		"  /read(path)     Attach file content to next message",
 	}

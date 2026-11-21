@@ -548,6 +548,10 @@ func Execute(call llm.ToolCall) (result string, pw *PendingWrite, err error) {
 	case "explore":
 		return "", nil, fmt.Errorf("explore is run by the agent, not tools.Execute")
 
+	// ── project_overview ─────────────────────────────────────────────────────
+	case "project_overview":
+		return projectOverview(call)
+
 	// ── repo_map ─────────────────────────────────────────────────────────────
 	case "repo_map":
 		return repoMap(call)
@@ -827,12 +831,13 @@ func looksBinary(data []byte) bool {
 // toolPathArgs lists, per read-only filesystem tool, which argument holds the
 // path and its default.
 var toolPathArgs = map[string][2]string{
-	"read_file":      {"path", ""},
-	"list_directory": {"path", "."},
-	"search_regex":   {"dir", "."},
-	"find_files":     {"dir", "."},
-	"map_workspace":  {"dir", "."},
-	"repo_map":       {"dir", "."},
+	"read_file":        {"path", ""},
+	"list_directory":   {"path", "."},
+	"search_regex":     {"dir", "."},
+	"find_files":       {"dir", "."},
+	"map_workspace":    {"dir", "."},
+	"repo_map":         {"dir", "."},
+	"project_overview": {"path", "."},
 }
 
 // NeedsApproval decides whether a native (non run_command,

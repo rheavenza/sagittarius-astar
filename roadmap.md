@@ -87,7 +87,7 @@ Prerequisite for headless mode, subagents and proper tests.
 - ✅ Plan mode: `/plan [task]` offers the model only read-only tools, blocks everything else,
   and asks for a numbered plan. `/go` approves it and starts the implementation.
 
-## Phase 5 — Whole-project understanding 🚧
+## Phase 5 — Whole-project understanding ✅
 - ✅ **Repo map** (`internal/repomap`): symbols and signatures per file, fitted to a token
   budget. Exposed as the `repo_map` tool (`dir`, `focus`, `max_tokens`); a version of about 1,000
   tokens goes into the system prompt in git repos.
@@ -99,9 +99,16 @@ Prerequisite for headless mode, subagents and proper tests.
   - The parse cache is keyed by mtime and size. The Go standard library (7k files) maps in about
     0.4 s cold and 20 ms cached.
   - Possible later improvement: tree-sitter for exact non-Go parsing.
-- ⬜ **`/summarize`**: map-reduce summaries (file → folder → project) on a cheap model, cached
-  by content hash in `~/.cache/aig/index/<repo>/`, so re-runs only cost the changed files.
-  Produces `PROJECT_SUMMARY.md` plus a `project_overview` tool.
+- ✅ **`/summarize`** (`internal/summary`): summaries per file, then per folder, then the
+  project, made with `summary_model` (falls back to the session's model).
+  - `/summarize` previews the cost; `go` runs it in the background with 4 requests at a time;
+    `stop` cancels; `show` prints the overview.
+  - Cached by content hash in `~/.cache/aig/index/<repo>-<hash>/`. A folder's cache key covers
+    its children's summaries, so an unchanged summary stops the re-run from going further up.
+  - It stops after 5 failed requests (bad key, rate limit) instead of failing every file, and
+    saves progress every 20 files.
+  - Produces `PROJECT_SUMMARY.md` and the `project_overview` tool (offered once an index exists;
+    changed files are flagged). The overview is added to the system prompt at session start.
 - ✅ **Exploration subagent**: `explore(question, hints?)` runs a nested agent turn with a fresh
   context (its own prompt, plus the environment, instructions and repo map) and returns its answer.
   - Only local read-only tools: no writes, commands, web or MCP, and it can't call `explore`
@@ -111,7 +118,9 @@ Prerequisite for headless mode, subagents and proper tests.
   - It gets 20 rounds; after that it must answer with no tools offered.
   - Allowed in plan mode.
   - Later: a separate cheaper model for subagents, and running several explore calls in parallel.
-- ⬜ **Semantic search**: embeddings (NIM / Gemini) in SQLite with a `semantic_search` tool.
+- ⬜ **Semantic search** (postponed): embeddings (NIM / Gemini) in SQLite with a
+  `semantic_search` tool. Revisit after Phase 6, once there's real usage data for
+  `repo_map` + `explore` + `project_overview`.
 
 ## Phase 6 — Context management ⬜
 - ⬜ Real token usage from API responses, plus a context-window table per model.

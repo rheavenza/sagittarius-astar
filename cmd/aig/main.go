@@ -35,6 +35,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/prompt"
 	"github.com/clitorhea/sagittarius-astar.git/internal/repomap"
 	"github.com/clitorhea/sagittarius-astar.git/internal/session"
+	"github.com/clitorhea/sagittarius-astar.git/internal/summary"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tools"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tui"
 )
@@ -291,7 +292,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 		Provider:       provider,
 		MCP:            mcpRegistry,
 		WorkspaceRoot:  cwd,
-		ContextBlock:   buildContextBlock(cwd, env, checksSection, repoMapSection()),
+		ContextBlock:   buildContextBlock(cwd, env, checksSection, overviewSection(cwd), repoMapSection()),
 		PostEditChecks: fc.PostEditChecks,
 		ProjectChecks:  projectChecks,
 	})
@@ -365,6 +366,20 @@ func buildContextBlock(cwd string, env prompt.Env, sections ...string) string {
 	}
 	logger.L.Info("context block built", "git_root", env.GitRoot, "instruction_files", len(files))
 	return prompt.BuildContextBlock(env, files, sections...)
+}
+
+// overviewSection returns the /summarize project overview for the system
+// prompt, if the project has one.
+func overviewSection(cwd string) string {
+	ix, err := summary.Load(summary.RootFor(cwd))
+	if err != nil {
+		logger.L.Warn("summary index unreadable", "error", err)
+		return ""
+	}
+	if ix == nil {
+		return ""
+	}
+	return prompt.RenderOverview(ix.Updated.Format("2006-01-02"), ix.Overview())
 }
 
 // repoMapStartupTimeout bounds the startup repo map; on a huge repo the

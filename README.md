@@ -157,12 +157,23 @@ On startup aig builds a context block that is appended to the system prompt of e
 | `multi_edit` | Several edits to one file, applied atomically with one diff and one confirmation |
 | `repo_map` | Definitions and signatures (with line numbers), grouped by file and ranked by how often they're referenced, cut to a token budget. `dir`, `focus` (paths or symbol names to rank first), `max_tokens` |
 | `explore` | Hands a codebase question to a subagent that starts with a fresh context and has only local read-only tools. Only its answer comes back, so the raw tool output never enters the main context |
+| `project_overview` | Reads the `/summarize` index: the project overview and folder list, one folder, or one file. Files that changed since are flagged. Offered once an index exists |
 | `run_checks` | Runs the project checks from `.aig/config.json` (only offered when some are configured) |
 
 After each confirmed write aig runs a quick check and returns the result to the model: `go vet` on the package (or `gofmt -e`), `python3 -m py_compile`, `bash -n`, `node --check`, JSON validation. Override or extend per extension:
 ```json
 "post_edit_checks": { ".ts": "npx tsc --noEmit -p {dir}", ".py": "off" }
 ```
+
+### Project summary (`/summarize`)
+- `/summarize` only previews: how many source files, how many are already cached, an estimated token count, and which model would be used.
+- `/summarize go` builds the summary in the background while you keep working. A cheap model writes 2–4 sentences per file, then a paragraph per folder, then a project overview.
+- Results go to `~/.cache/aig/index/<repo>-<hash>/` (`index.json`, `PROJECT_SUMMARY.md`). Nothing is written into the repo.
+- Summaries are cached by content, so re-runs only pay for changed files and the folders above them. A folder whose summary came out the same doesn't trigger new requests above it.
+- Skipped: tests, generated and vendored files, and non-source files. Each file sends at most 24 KB to the model.
+- `/summarize stop` cancels; finished summaries are kept and `go` resumes. `/summarize show` prints the overview.
+- After a run, the agent gets the `project_overview` tool, and the overview is added to the system prompt from the next session.
+- Choose the model with `"summary_model": "deepseek:deepseek-v4-flash"` (`provider:model`, or just a model of the current provider). Without it, the session's model is used.
 
 ### Project checks (definition of done)
 Put the project's checks in `.aig/config.json` (working directory or git root). They run in the order listed, from the directory that contains `.aig/`:

@@ -495,3 +495,38 @@ func TestShiftTabCyclesModes(t *testing.T) {
 		t.Fatal("/mode edits not applied")
 	}
 }
+
+func TestTUISummarizePreviewRunAndShow(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	d := newDriver(t, &fakeProvider{})
+	cwd, _ := os.Getwd()
+	os.WriteFile(filepath.Join(cwd, "a.go"), []byte("package a\n"), 0o644)
+	os.WriteFile(filepath.Join(cwd, "b.go"), []byte("package a\n"), 0o644)
+
+	d.submit("/summarize")
+	out := output(d.m)
+	if !strings.Contains(out, "2 source files: 0 cached, 2 to summarize") || !strings.Contains(out, "/summarize go") {
+		t.Fatalf("preview:\n%s", out)
+	}
+	if d.m.summary != nil {
+		t.Fatal("preview must not start a run")
+	}
+
+	d.submit("/summarize go")
+	if d.m.summary == nil {
+		t.Fatal("run not started")
+	}
+	d.runUntil("summary done", func(m Model) bool { return strings.Contains(output(m), "Project summary written") })
+	if d.m.summary != nil {
+		t.Error("job not cleared")
+	}
+
+	d.submit("/summarize")
+	if !strings.Contains(output(d.m), "Project summary is up to date (2 files)") {
+		t.Errorf("second preview:\n%s", output(d.m))
+	}
+	d.submit("/summarize show")
+	if !strings.Contains(output(d.m), "PROJECT_SUMMARY.md") {
+		t.Errorf("show:\n%s", output(d.m))
+	}
+}

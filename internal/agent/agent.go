@@ -19,6 +19,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 	"github.com/clitorhea/sagittarius-astar.git/internal/mcp"
+	"github.com/clitorhea/sagittarius-astar.git/internal/summary"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tools"
 )
 
@@ -67,6 +68,7 @@ type Agent struct {
 	workspaceRoot  string
 	postEditChecks map[string]string
 	projectChecks  tools.ProjectChecks
+	summaryRoot    string // repo root whose /summarize index project_overview reads
 	maxTokens      int
 	checkpoints    Checkpointer
 
@@ -125,6 +127,7 @@ func New(o Options) *Agent {
 		workspaceRoot:  o.WorkspaceRoot,
 		postEditChecks: o.PostEditChecks,
 		projectChecks:  o.ProjectChecks,
+		summaryRoot:    summaryRootFor(o.WorkspaceRoot),
 		maxTokens:      o.MaxContextTokens,
 		checkpoints:    o.Checkpoints,
 	}
@@ -150,6 +153,22 @@ func (a *Agent) SetContextBlock(s string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.contextBlock = strings.TrimSpace(s)
+}
+
+func summaryRootFor(workspaceRoot string) string {
+	if workspaceRoot == "" {
+		return ""
+	}
+	return summary.RootFor(workspaceRoot)
+}
+
+// indexDefs returns project_overview while the project has a /summarize
+// index (checked per request, so a /summarize run mid-session enables it).
+func (a *Agent) indexDefs() []llm.Tool {
+	if a.summaryRoot != "" && summary.Exists(a.summaryRoot) {
+		return []llm.Tool{tools.ProjectOverviewDefinition()}
+	}
+	return nil
 }
 
 // contextBlockSnapshot returns the context block (without plan directive).
@@ -342,7 +361,7 @@ func (t *turn) stream(ctx context.Context) (text, reasoning string, calls []llm.
 	case t.toolDefs != nil:
 		defs = t.toolDefs
 	default:
-		defs = tools.Definitions()
+		defs = append(tools.Definitions(), t.a.indexDefs()...)
 		if len(t.a.projectChecks.Checks) > 0 {
 			defs = append(defs, tools.RunChecksDefinition(t.a.projectChecks))
 		}
