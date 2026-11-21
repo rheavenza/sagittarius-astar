@@ -1174,12 +1174,12 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 		} else if msg.Role == llm.RoleTool {
 			if strings.HasPrefix(msg.Content, "Error:") {
 				m.outputLines = append(m.outputLines, errorStyle.Render(fmt.Sprintf("✗ Tool %s failed", msg.ToolName)))
-				if msg.ToolName == "run_command" {
+				if msg.ToolName == "run_command" || msg.ToolName == "run_checks" {
 					m.outputLines = append(m.outputLines, errorStyle.Render(msg.Content))
 				}
 			} else {
 				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s done", msg.ToolName)))
-				if msg.ToolName == "run_command" {
+				if msg.ToolName == "run_command" || msg.ToolName == "run_checks" {
 					m.outputLines = append(m.outputLines, execResultStyle.Render(msg.Content))
 				}
 			}

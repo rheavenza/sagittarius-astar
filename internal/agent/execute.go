@@ -48,7 +48,8 @@ func (t *turn) ask(ctx context.Context, req *ApprovalRequest) (ApprovalReply, bo
 //
 // Policy by permission mode (see Mode):
 //   - file writes ask, except inside the workspace in accept-edits/auto mode;
-//   - run_command asks, except in auto mode (destructive commands still ask);
+//   - run_command and run_checks ask, except in auto mode (destructive
+//     commands still ask);
 //   - MCP tools ask unless their server is trusted or in auto mode;
 //   - web_fetch and reads outside the workspace ask unless in auto mode;
 //   - other read-only tools run directly.
@@ -84,6 +85,9 @@ func (t *turn) execute(ctx context.Context, call llm.ToolCall) outcome {
 
 	switch risk {
 	case tools.RiskExec:
+		if call.Name == "run_checks" {
+			return t.runChecks(ctx, call, auto)
+		}
 		return t.runCommand(ctx, call, auto)
 	case tools.RiskWrite:
 		return t.write(ctx, call)
@@ -226,4 +230,42 @@ func sudoAuthFailed(out string, err error) bool {
 		s += " " + strings.ToLower(err.Error())
 	}
 	return strings.Contains(s, "incorrect password") || strings.Contains(s, "sorry, try again")
+}
+
+// runChecks runs the project's configured checks (or the named subset) after
+// one approval covering all of them.
+func (t *turn) runChecks(ctx context.Context, call llm.ToolCall, auto bool) outcome {
+	pc := t.a.projectChecks
+	if len(pc.Checks) == 0 {
+		return outcome{err: fmt.Errorf("run_checks: this project has no checks configured (.aig/config.json)")}
+	}
+	checks, err := pc.Select(tools.CheckNames(call))
+	if err != nil {
+		return outcome{err: fmt.Errorf("run_checks: %w", err)}
+	}
+
+	var lines []string
+	reason := ""
+	for _, c := range checks {
+		lines = append(lines, c.Name+": "+c.Command)
+		if bad, why := tools.DangerousCommand(c.Command); bad && reason == "" {
+			reason = c.Name + " " + why
+		}
+	}
+	title := "run_checks in " + pc.Root
+	if auto && reason != "" {
+		auto = false
+		title = "⚠ destructive check (" + reason + ") — confirmation required even in auto mode"
+	}
+	if !auto {
+		req := newRequest(&ApprovalRequest{Kind: ApproveTool, Call: call, Title: title, Command: strings.Join(lines, "\n"), Risk: tools.RiskExec})
+		if _, ok := t.ask(ctx, req); !ok {
+			return deniedOutcome("Checks skipped by user.")
+		}
+	}
+
+	t.ensureCheckpoint()
+	t.emit(ToolStartEvent{Call: call, Command: strings.Join(lines, " · "), Auto: auto})
+	results := tools.RunProjectChecks(ctx, pc, checks)
+	return outcome{result: tools.FormatCheckResults(results, len(checks))}
 }

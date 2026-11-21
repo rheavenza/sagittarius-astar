@@ -32,7 +32,6 @@ This file serves as a compressed "brain dump" for future AI agents working on th
    - **Real-Time Thought Streaming**: Upgraded Gemini and DeepSeek providers to stream reasoning tokens immediately, prefixed with a null byte (`\x00`).
    - **Visual Rendering**: Created a distinct styled display for reasoning (italicized, left-border indented Catppuccin palette).
    - **StatusBar Toggle**: Toggles status text to `● deliberating` when the model is in its thinking cycle.
-   - **Plan-Action-Reflection (PAR) Loop**: Dynamically injects planning and reflection instructions into system prompts when tools are active.
 
 3. **Loop Breaker Circuit**
    - **Consecutive Same-Call Breaker**: Intercepts tool execution if the exact same tool and argument hash are called 3 times consecutively. Halts the execution loop and injects a warning context to force model re-evaluation.
@@ -56,6 +55,7 @@ This file serves as a compressed "brain dump" for future AI agents working on th
 - **Checkpoints**: `agent.turn.ensureCheckpoint` runs once per turn right before the first mutation (after approval). Any new mutating tool must call it. Git snapshots must never touch the user's index: always use `GIT_INDEX_FILE` with a temp copy (`gitRepo.tempIndex`).
 - **Plan mode** is snapshotted per turn (`turn.planMode`); it filters tool definitions to read/network risk and denies everything else in `execute`.
 - **Layout is measured, not hard-coded** (`layout.go`): `recalculateDimensions` runs after every update and sizes the viewport from the rendered header/status/input heights; `View` clamps the frame to the terminal height. Render input-area boxes with `m.activeBox`/`m.idleBox` (fixed width) and conversation rules with `m.convDivider()` (viewport width, which is one column narrower for the scrollbar). A frame taller than the terminal causes duplicated lines.
+- **Project checks**: `.aig/config.json` → `config.LoadProjectConfig` (keeps the JSON key order) → `tools.ProjectChecks` on `agent.Options`. `run_checks` is offered only when checks exist, it is RiskExec (so plan mode blocks it), and `agent.runChecks` asks once for all checks. `sandbox.Options.MaxTimeout` raises the 120 s command ceiling for it.
 - **Permission modes** live in `agent.Mode` (+ `PlanMode`); the policy is in `agent/execute.go`. Destructive command patterns: `tools.DangerousCommand`.
 - **Loop breakers** are per turn (state on `agent.turn`), so they reset automatically for each user message.
 - **Every tool_call needs a result**: Any path that stops a tool batch early (loop breaker, user abort, denial, cancelled write/sudo) MUST append a tool message for each unanswered call (`answerRemainingToolCalls` / `skippedToolResults` in `internal/tui/toolflow.go`). OpenAI-compatible APIs return HTTP 400 otherwise.

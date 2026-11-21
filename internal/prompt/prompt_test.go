@@ -66,3 +66,15 @@ func TestLargeInstructionFileTruncated(t *testing.T) {
 		t.Fatalf("not truncated: %d bytes", len(f.Content))
 	}
 }
+
+func TestRenderChecks(t *testing.T) {
+	if RenderChecks("x", nil) != "" {
+		t.Error("no checks should render nothing")
+	}
+	s := RenderChecks("/p/.aig/config.json", []Check{{"test", "go test ./..."}})
+	for _, want := range []string{"# Definition of done", "run_checks", "- test: `go test ./...`", "/p/.aig/config.json"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("missing %q in:\n%s", want, s)
+		}
+	}
+}

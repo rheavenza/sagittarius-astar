@@ -34,11 +34,14 @@ const (
 
 // Options configures an Agent.
 type Options struct {
-	Provider         llm.Provider
-	MCP              *mcp.Registry // may be nil
-	WorkspaceRoot    string        // reads inside it run without approval
-	ContextBlock     string        // appended to the system prompt of each request
-	PostEditChecks   map[string]string
+	Provider       llm.Provider
+	MCP            *mcp.Registry // may be nil
+	WorkspaceRoot  string        // reads inside it run without approval
+	ContextBlock   string        // appended to the system prompt of each request
+	PostEditChecks map[string]string
+	// ProjectChecks is the project's definition of done (.aig/config.json);
+	// when it has checks, the run_checks tool is offered.
+	ProjectChecks    tools.ProjectChecks
 	MaxContextTokens int
 	// Checkpoints, if set, snapshots the workspace before the first change
 	// of each turn (write, command, or MCP call) so it can be undone.
@@ -63,6 +66,7 @@ type Agent struct {
 	mcp            *mcp.Registry
 	workspaceRoot  string
 	postEditChecks map[string]string
+	projectChecks  tools.ProjectChecks
 	maxTokens      int
 	checkpoints    Checkpointer
 
@@ -120,6 +124,7 @@ func New(o Options) *Agent {
 		mcp:            o.MCP,
 		workspaceRoot:  o.WorkspaceRoot,
 		postEditChecks: o.PostEditChecks,
+		projectChecks:  o.ProjectChecks,
 		maxTokens:      o.MaxContextTokens,
 		checkpoints:    o.Checkpoints,
 	}
@@ -320,6 +325,9 @@ func (t *turn) stream(ctx context.Context) (text, reasoning string, calls []llm.
 	pruned := llm.PruneHistory(t.history, t.a.maxTokens)
 	outgoing := WithContextBlock(pruned, t.contextBlock)
 	defs := tools.Definitions()
+	if len(t.a.projectChecks.Checks) > 0 {
+		defs = append(defs, tools.RunChecksDefinition(t.a.projectChecks))
+	}
 	if t.planMode {
 		defs = readOnlyDefs(defs)
 	} else if t.a.mcp != nil {

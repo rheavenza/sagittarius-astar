@@ -33,6 +33,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/mcp"
 	"github.com/clitorhea/sagittarius-astar.git/internal/prompt"
 	"github.com/clitorhea/sagittarius-astar.git/internal/session"
+	"github.com/clitorhea/sagittarius-astar.git/internal/tools"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tui"
 )
 
@@ -275,6 +276,8 @@ func runChat(_ *cobra.Command, _ []string) error {
 
 	// ── Agent ───────────────────────────────────────────────────────────────────────────────
 	cwd, _ := os.Getwd()
+	env := prompt.DetectEnv(cwd)
+	projectChecks, checksSection := loadProjectChecks(cwd, env.GitRoot)
 	checkpoints := checkpoint.New(cwd, activeSession.ID)
 	logger.L.Info("checkpoints enabled", "mode", checkpoints.Mode())
 	ag := agent.New(agent.Options{
@@ -282,8 +285,9 @@ func runChat(_ *cobra.Command, _ []string) error {
 		Provider:       provider,
 		MCP:            mcpRegistry,
 		WorkspaceRoot:  cwd,
-		ContextBlock:   buildContextBlock(),
+		ContextBlock:   buildContextBlock(cwd, env, checksSection),
 		PostEditChecks: fc.PostEditChecks,
+		ProjectChecks:  projectChecks,
 	})
 
 	if fc.PermissionMode != "" {
@@ -333,15 +337,11 @@ func resolveLocalPrompt() string {
 	return ""
 }
 
-// buildContextBlock detects the environment and loads instruction files
-// (AGENTS.md, CLAUDE.md, .aig/instructions.md in cwd and the git root, plus
-// the user's global ~/.config/aig/AGENTS.md). Repo files need consent.
-func buildContextBlock() string {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return ""
-	}
-	env := prompt.DetectEnv(cwd)
+// buildContextBlock loads instruction files (AGENTS.md, CLAUDE.md,
+// .aig/instructions.md in cwd and the git root, plus the user's global
+// ~/.config/aig/AGENTS.md) and joins them with the environment and the
+// project checks section. Repo files need consent.
+func buildContextBlock(cwd string, env prompt.Env, checksSection string) string {
 
 	var files []prompt.InstructionFile
 	if g := prompt.GlobalInstructionFile(filepath.Dir(config.Path())); g != "" {
@@ -358,7 +358,37 @@ func buildContextBlock() string {
 		}
 	}
 	logger.L.Info("context block built", "git_root", env.GitRoot, "instruction_files", len(files))
-	return prompt.BuildContextBlock(env, files)
+	return prompt.BuildContextBlock(env, files, checksSection)
+}
+
+// loadProjectChecks reads .aig/config.json (cwd, then git root) after
+// consent and returns its checks plus the "Definition of done" prompt section.
+// A broken file is reported on stderr and ignored.
+func loadProjectChecks(cwd, gitRoot string) (tools.ProjectChecks, string) {
+	path := config.FindProjectConfig(cwd, gitRoot)
+	if path == "" {
+		return tools.ProjectChecks{}, ""
+	}
+	pc, err := config.LoadProjectConfig(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aig: ignoring project config: %v\n", err)
+		logger.L.Warn("invalid project config", "path", path, "error", err)
+		return tools.ProjectChecks{}, ""
+	}
+	if len(pc.Checks) == 0 {
+		return tools.ProjectChecks{}, ""
+	}
+	if !askTrust(path, "The agent will run its checks as shell commands") {
+		return tools.ProjectChecks{}, ""
+	}
+	out := tools.ProjectChecks{Root: pc.Root, Timeout: time.Duration(pc.ChecksTimeoutSeconds) * time.Second}
+	var section []prompt.Check
+	for _, c := range pc.Checks {
+		out.Checks = append(out.Checks, tools.ProjectCheck{Name: c.Name, Command: c.Command})
+		section = append(section, prompt.Check{Name: c.Name, Command: c.Command})
+	}
+	logger.L.Info("project checks loaded", "path", path, "checks", len(out.Checks))
+	return out, prompt.RenderChecks(path, section)
 }
 
 // askTrust returns true if path was previously approved with its current

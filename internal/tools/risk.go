@@ -48,6 +48,7 @@ var nativeRisk = map[string]Risk{
 	"edit_file":      RiskWrite,
 	"multi_edit":     RiskWrite,
 	"run_command":    RiskExec,
+	"run_checks":     RiskExec,
 }
 
 // RiskOf returns the risk of a native tool, and whether the name is a native tool.

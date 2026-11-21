@@ -151,14 +151,32 @@ On startup aig builds a context block that is appended to the system prompt of e
 |---|---|
 | `read_file` | Line-numbered output (`N<TAB>line`), line ranges, cut off at 50 KB on a line boundary |
 | `find_files` | Glob search (`*.go`, `internal/**/*_test.go`, `*.{ts,tsx}`), `.gitignore`-aware |
-| `search_regex` | ripgrep when installed, Go fallback; `.gitignore`-aware, skips binaries, `case_insensitive` |
+| `search_regex` | ripgrep when installed, Go fallback; `.gitignore`-aware, skips binaries and dependency/build dirs (`node_modules`, `vendor`, `target`, …), `case_insensitive` |
 | `edit_file` | Exact replace, `replace_all`, tolerant of whitespace/indentation differences and copied line numbers |
 | `multi_edit` | Several edits to one file, applied atomically with one diff and one confirmation |
+| `run_checks` | Runs the project checks from `.aig/config.json` (only offered when some are configured) |
 
 After each confirmed write aig runs a quick check and returns the result to the model: `go vet` on the package (or `gofmt -e`), `python3 -m py_compile`, `bash -n`, `node --check`, JSON validation. Override or extend per extension:
 ```json
 "post_edit_checks": { ".ts": "npx tsc --noEmit -p {dir}", ".py": "off" }
 ```
+
+### Project checks (definition of done)
+Put the project's checks in `.aig/config.json` (working directory or git root). They run in the order listed, from the directory that contains `.aig/`:
+```json
+{
+  "checks": {
+    "build": "go build ./...",
+    "vet":   "go vet ./...",
+    "test":  "go test ./..."
+  },
+  "checks_timeout_seconds": 300
+}
+```
+- The model sees them in a *Definition of done* prompt section and gets a `run_checks` tool (`names` optional, all checks by default). It is told a change isn't finished until they pass.
+- `run_checks` asks for one approval that covers every check it runs. Auto mode runs them without asking, unless a check matches a destructive pattern. Plan mode blocks it.
+- The result has PASS/FAIL per check; only failing checks include output (head and tail). Each check gets 300 s by default, up to 1800 s.
+- A repository can ship this file, so it needs the same one-time consent as `AGENTS.md`. To keep checks local, add `.aig/` to `.git/info/exclude`.
 
 ### NVIDIA NIM
 - Provider name `nim` (alias `nvidia`). Uses the OpenAI-compatible API at `https://integrate.api.nvidia.com/v1`, or `nim_base_url` / `NIM_BASE_URL` for a self-hosted NIM (no API key needed then).

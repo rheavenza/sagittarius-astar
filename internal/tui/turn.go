@@ -155,6 +155,8 @@ func (m Model) handleAgentEvent(msg agentEventMsg) (Model, tea.Cmd) {
 			m.execTimeout = time.Duration(v) * time.Second
 		} else if ev.Call.Name == "run_command" {
 			m.execTimeout = sandbox.DefaultTimeout
+		} else if ev.Call.Name == "run_checks" {
+			m.execTimeout = tools.MaxChecksTimeout
 		}
 		m.appendOutput(toolStartLine(ev))
 		m.refreshViewport()
@@ -308,6 +310,12 @@ func toolStartLine(ev agent.ToolStartEvent) string {
 			prefix += " (auto)"
 		}
 		return style.Render(fmt.Sprintf("%s: %s", prefix, ev.Command))
+	case ev.Call.Name == "run_checks":
+		prefix := "✅ run_checks"
+		if ev.Auto {
+			prefix += " (auto)"
+		}
+		return style.Render(fmt.Sprintf("%s: %s", prefix, ev.Command))
 	case tools.IsWriteTool(ev.Call.Name):
 		path, _ := ev.Call.Args["path"].(string)
 		return style.Render("✍  Writing " + path + "…")
@@ -326,7 +334,7 @@ func (m *Model) renderToolResult(ev agent.ToolResultEvent) {
 		m.appendOutput(errorStyle.Render("  " + tools.TruncateUTF8(ev.Err.Error(), 2000)))
 	default:
 		m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s done", name)))
-		if name == "run_command" {
+		if name == "run_command" || name == "run_checks" {
 			m.appendOutput(execResultStyle.Render(ev.Result))
 		}
 		if i := strings.Index(ev.Result, "Post-edit check"); i >= 0 {
@@ -371,6 +379,11 @@ func (m *Model) renderApproval(req *agent.ApprovalRequest) {
 		}
 	default:
 		m.appendOutput(confirmStyle.Render("⚠ " + req.Title))
+		if req.Call.Name == "run_checks" {
+			m.appendOutput(codeBlockStyle.Render(req.Command))
+			m.appendOutput(hint.Render("Enter to run · Esc to skip · Ctrl+C to cancel the turn"))
+			return
+		}
 		args, _ := json.MarshalIndent(req.Call.Args, "", "  ")
 		argStr := tools.TruncateUTF8(string(args), 1500)
 		if len(argStr) < len(args) {

@@ -126,6 +126,10 @@ type Options struct {
 	// Values ≤ 0 use DefaultTimeout; values > MaxTimeout are clamped to MaxTimeout.
 	Timeout time.Duration
 
+	// MaxTimeout raises the Timeout ceiling for this call (project checks
+	// such as test suites). 0 = MaxTimeout.
+	MaxTimeout time.Duration
+
 	// SudoPassword is the password to use for sudo commands (fallback when no
 	// graphical askpass helper is available).
 	SudoPassword string
@@ -184,12 +188,16 @@ func ExecuteWithStdin(ctx context.Context, command string, stdin io.Reader, opts
 		opt = opts[0]
 	}
 
+	ceiling := MaxTimeout
+	if opt.MaxTimeout > 0 {
+		ceiling = opt.MaxTimeout
+	}
 	timeout := opt.Timeout
 	switch {
 	case timeout <= 0:
 		timeout = DefaultTimeout
-	case timeout > MaxTimeout:
-		timeout = MaxTimeout
+	case timeout > ceiling:
+		timeout = ceiling
 	}
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)

@@ -272,6 +272,17 @@ func ripgrep(rg, pattern, dir, fileGlob string) ([]string, bool, error) {
 	if fileGlob != "" {
 		args = append(args, "--glob", fileGlob)
 	}
+	// Skip the same dependency/build dirs as the Go fallback even when no
+	// .gitignore lists them, unless the search starts inside one.
+	inside := map[string]bool{}
+	for _, part := range strings.Split(filepath.ToSlash(filepath.Clean(dir)), "/") {
+		inside[part] = true
+	}
+	for _, name := range workspace.IgnoredDirNames() {
+		if !inside[name] {
+			args = append(args, "--glob", "!"+name+"/")
+		}
+	}
 	args = append(args, "--regexp", pattern, "--", dir)
 	cmd := exec.CommandContext(ctx, rg, args...)
 	stdout, err := cmd.StdoutPipe()

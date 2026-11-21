@@ -26,7 +26,7 @@ Cheap, high-impact: the model should know where it is and what the project expec
 - ✅ **Removed the forced Plan-Action-Reflection directive** and the `<think>` instruction.
   Thinking models already reason; forcing it again duplicated reasoning and padded answers.
 
-## Phase 2 — Coding tools ✅ (except project `checks`)  *(branch `feat/agent-context-tools`)*
+## Phase 2 — Coding tools ✅  *(branch `feat/agent-context-tools`)*
 Most edit failures come from the tools, not from the model.
 
 - ✅ `read_file` output has line numbers (`N<TAB>line`).
@@ -40,8 +40,10 @@ Most edit failures come from the tools, not from the model.
 - ✅ **Checks after each edit**: syntax/compile checks run after a confirmed write (`go build`,
   `gofmt -e`, `python -m py_compile`, `bash -n`, JSON validation; extensible via config), and
   errors go back into the tool result.
-- ⬜ Project `checks` in config (`"test": "go test ./..."`) surfaced to the model as the
-  definition of done.
+- ✅ **Project checks** in `.aig/config.json` (`"test": "go test ./..."`), run in order by a
+  `run_checks` tool and shown to the model as the definition of done. The file needs consent
+  per content hash, all checks share one approval, and destructive checks still ask in auto
+  mode.
 
 ## Phase 3 — Agent core refactor ✅  *(branch `refactor/agent-core`)*
 Prerequisite for headless mode, subagents and proper tests.

@@ -104,11 +104,35 @@ func RenderInstructions(files []InstructionFile) string {
 	return b.String()
 }
 
-// BuildContextBlock joins the environment and instruction sections.
-func BuildContextBlock(env Env, files []InstructionFile) string {
+// Check is a named project check shown in the "Definition of done" section.
+type Check struct {
+	Name    string
+	Command string
+}
+
+// RenderChecks formats the project's checks as its definition of done.
+func RenderChecks(source string, checks []Check) string {
+	if len(checks) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("# Definition of done\n")
+	b.WriteString("This project defines checks in " + source + ". A code change is not finished until they pass: run them with the run_checks tool (all of them, or the relevant ones by name), fix any failures, and say in your answer which checks you ran and their result. Skip this only for changes that cannot affect them (docs, comments) and say so.\n")
+	for _, c := range checks {
+		b.WriteString("- " + c.Name + ": `" + c.Command + "`\n")
+	}
+	return b.String()
+}
+
+// BuildContextBlock joins the environment, instruction and checks sections.
+// checks may be "" (see RenderChecks).
+func BuildContextBlock(env Env, files []InstructionFile, checks string) string {
 	parts := []string{env.Render()}
 	if s := RenderInstructions(files); s != "" {
 		parts = append(parts, s)
+	}
+	if checks != "" {
+		parts = append(parts, checks)
 	}
 	return strings.Join(parts, "\n")
 }

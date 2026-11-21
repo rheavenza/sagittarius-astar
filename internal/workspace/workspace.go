@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -38,6 +39,16 @@ var ignoredDirs = map[string]bool{
 // skipped during recursive traversal (VCS metadata, dependency and build dirs).
 func IsIgnoredDir(name string) bool {
 	return ignoredDirs[name]
+}
+
+// IgnoredDirNames returns the names IsIgnoredDir skips, sorted.
+func IgnoredDirNames() []string {
+	out := make([]string, 0, len(ignoredDirs))
+	for name := range ignoredDirs {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // MapDirectory returns a tree-like string representation of the given directory.

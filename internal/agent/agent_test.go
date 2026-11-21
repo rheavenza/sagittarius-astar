@@ -529,3 +529,80 @@ func TestParseMode(t *testing.T) {
 		t.Error("bogus mode accepted")
 	}
 }
+
+func TestRunChecks(t *testing.T) {
+	dir := t.TempDir()
+	checks := tools.ProjectChecks{Root: dir, Checks: []tools.ProjectCheck{
+		{Name: "ok", Command: "echo fine"},
+		{Name: "fail", Command: "echo broken; exit 1"},
+	}}
+	call := func(args map[string]any) []reply {
+		return []reply{{calls: []llm.ToolCall{{ID: "1", Name: "run_checks", Args: args}}}, {tokens: []string{"done"}}}
+	}
+
+	t.Run("asks in default mode and reports failures", func(t *testing.T) {
+		p := &fakeProvider{replies: call(map[string]any{})}
+		a := New(Options{Provider: p, ProjectChecks: checks})
+		asked := 0
+		evs, msgs := collect(t, a.Run(context.Background(), user("check")), func(r *ApprovalRequest) {
+			asked++
+			if r.Kind != ApproveTool || !strings.Contains(r.Command, "fail: echo broken") {
+				t.Errorf("approval = %+v", r)
+			}
+			r.Approve("")
+		})
+		done(t, evs)
+		if asked != 1 {
+			t.Errorf("asked %d times, want once for all checks", asked)
+		}
+		if !strings.Contains(msgs[1].Content, "1 of 2 checks FAILED") || !strings.Contains(msgs[1].Content, "broken") {
+			t.Errorf("result = %q", msgs[1].Content)
+		}
+	})
+
+	t.Run("auto mode runs a subset without asking", func(t *testing.T) {
+		p := &fakeProvider{replies: call(map[string]any{"names": []any{"ok"}})}
+		a := New(Options{Provider: p, ProjectChecks: checks})
+		a.SetMode(ModeAuto)
+		evs, msgs := collect(t, a.Run(context.Background(), user("check")), func(r *ApprovalRequest) {
+			t.Fatalf("auto mode asked: %+v", r)
+		})
+		done(t, evs)
+		if !strings.Contains(msgs[1].Content, "All 1 checks passed") {
+			t.Errorf("result = %q", msgs[1].Content)
+		}
+	})
+
+	t.Run("destructive check still asks in auto mode", func(t *testing.T) {
+		bad := tools.ProjectChecks{Root: dir, Checks: []tools.ProjectCheck{{Name: "clean", Command: "git clean -fdx"}}}
+		p := &fakeProvider{replies: call(map[string]any{})}
+		a := New(Options{Provider: p, ProjectChecks: bad})
+		a.SetMode(ModeAuto)
+		evs, msgs := collect(t, a.Run(context.Background(), user("check")), func(r *ApprovalRequest) { r.Deny() })
+		done(t, evs)
+		if !strings.Contains(msgs[1].Content, "skipped by user") {
+			t.Errorf("result = %q", msgs[1].Content)
+		}
+	})
+
+	t.Run("unknown name is an error", func(t *testing.T) {
+		p := &fakeProvider{replies: call(map[string]any{"names": []any{"nope"}})}
+		a := New(Options{Provider: p, ProjectChecks: checks})
+		evs, msgs := collect(t, a.Run(context.Background(), user("check")), nil)
+		done(t, evs)
+		if !strings.Contains(msgs[1].Content, "unknown check") {
+			t.Errorf("result = %q", msgs[1].Content)
+		}
+	})
+
+	t.Run("blocked in plan mode", func(t *testing.T) {
+		p := &fakeProvider{replies: call(map[string]any{})}
+		a := New(Options{Provider: p, ProjectChecks: checks})
+		a.SetPlanMode(true)
+		evs, msgs := collect(t, a.Run(context.Background(), user("check")), nil)
+		done(t, evs)
+		if !strings.Contains(msgs[1].Content, "Plan mode is active") {
+			t.Errorf("result = %q", msgs[1].Content)
+		}
+	})
+}
