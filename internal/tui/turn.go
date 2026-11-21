@@ -211,7 +211,11 @@ func (m Model) handleAgentEvent(msg agentEventMsg) (Model, tea.Cmd) {
 		case agent.NoticeError:
 			style = errorStyle
 		}
-		m.appendOutput(style.Render("⚠ " + ev.Text))
+		prefix := "⚠ "
+		if ev.Level == agent.NoticeInfo {
+			prefix = "" // progress / status lines carry their own icon
+		}
+		m.appendOutput(style.Render(prefix + ev.Text))
 		m.refreshViewport()
 		return m, next
 
@@ -310,6 +314,9 @@ func toolStartLine(ev agent.ToolStartEvent) string {
 			prefix += " (auto)"
 		}
 		return style.Render(fmt.Sprintf("%s: %s", prefix, ev.Command))
+	case ev.Call.Name == "explore":
+		q, _ := ev.Call.Args["question"].(string)
+		return style.Render("🔭 explore: " + tools.TruncateUTF8(q, 200))
 	case ev.Call.Name == "run_checks":
 		prefix := "✅ run_checks"
 		if ev.Auto {
@@ -334,7 +341,7 @@ func (m *Model) renderToolResult(ev agent.ToolResultEvent) {
 		m.appendOutput(errorStyle.Render("  " + tools.TruncateUTF8(ev.Err.Error(), 2000)))
 	default:
 		m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s done", name)))
-		if name == "run_command" || name == "run_checks" {
+		if name == "run_command" || name == "run_checks" || name == "explore" {
 			m.appendOutput(execResultStyle.Render(ev.Result))
 		}
 		if i := strings.Index(ev.Result, "Post-edit check"); i >= 0 {

@@ -27,12 +27,18 @@ type fakeProvider struct {
 	mu       sync.Mutex
 	replies  []reply
 	requests [][]llm.Message
+	toolSets [][]string // tool names offered with each request
 }
 
-func (f *fakeProvider) StreamChat(ctx context.Context, msgs []llm.Message, _ []llm.Tool, ch chan<- string) ([]llm.ToolCall, string, error) {
+func (f *fakeProvider) StreamChat(ctx context.Context, msgs []llm.Message, defs []llm.Tool, ch chan<- string) ([]llm.ToolCall, string, error) {
 	defer close(ch)
 	f.mu.Lock()
 	f.requests = append(f.requests, append([]llm.Message(nil), msgs...))
+	var names []string
+	for _, d := range defs {
+		names = append(names, d.Name)
+	}
+	f.toolSets = append(f.toolSets, names)
 	if len(f.replies) == 0 {
 		f.mu.Unlock()
 		return nil, "", nil

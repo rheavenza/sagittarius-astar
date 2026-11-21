@@ -300,6 +300,27 @@ Prefer specific, targeted commands. Avoid commands that start interactive sessio
 				},
 			},
 		},
+		// ── explore ──────────────────────────────────────────────────────────
+		{
+			Name: "explore",
+			Description: "Delegate a codebase question to a subagent that has a fresh context and local read-only tools (repo_map, search_regex, find_files, read_file, …). It investigates and returns its findings: direct answer, path:line evidence, how the pieces connect. " +
+				"Use it for broad questions that would take many searches and reads (\"where is X handled and how does it reach Y?\", \"what calls this and with which arguments?\"), so the raw output doesn't fill your context. " +
+				"Don't use it for a single lookup that one search_regex or read_file answers. You don't see its tool output: read the files yourself before editing them. Several independent questions can be separate explore calls.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"question": map[string]any{
+						"type":        "string",
+						"description": "A specific, self-contained question. Say what you need back (e.g. \"list each call site with path:line\").",
+					},
+					"hints": map[string]any{
+						"type":        "string",
+						"description": "Optional starting points: files, packages or symbol names you already know are relevant.",
+					},
+				},
+				"required": []string{"question"},
+			},
+		},
 		// ── web_search ───────────────────────────────────────────────────────
 		{
 			Name:        "web_search",
@@ -522,6 +543,10 @@ func Execute(call llm.ToolCall) (result string, pw *PendingWrite, err error) {
 			return "", nil, err
 		}
 		return tree, nil, nil
+
+	// ── explore ──────────────────────────────────────────────────────────────
+	case "explore":
+		return "", nil, fmt.Errorf("explore is run by the agent, not tools.Execute")
 
 	// ── repo_map ─────────────────────────────────────────────────────────────
 	case "repo_map":

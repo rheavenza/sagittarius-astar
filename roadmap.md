@@ -102,8 +102,15 @@ Prerequisite for headless mode, subagents and proper tests.
 - ⬜ **`/summarize`**: map-reduce summaries (file → folder → project) on a cheap model, cached
   by content hash in `~/.cache/aig/index/<repo>/`, so re-runs only cost the changed files.
   Produces `PROJECT_SUMMARY.md` plus a `project_overview` tool.
-- ⬜ **Exploration subagent**: `explore(question)` runs a separate agent with read-only tools and
-  a fresh context, and returns a summary. Keeps the main context small. (Needs Phase 3.)
+- ✅ **Exploration subagent**: `explore(question, hints?)` runs a nested agent turn with a fresh
+  context (its own prompt, plus the environment, instructions and repo map) and returns its answer.
+  - Only local read-only tools: no writes, commands, web or MCP, and it can't call `explore`
+    again. It never asks for approval; anything that would need it is refused.
+  - Its tool calls show in the TUI as `↳ explore: read_file …`. Esc/Ctrl+C cancels it along with
+    the turn.
+  - It gets 20 rounds; after that it must answer with no tools offered.
+  - Allowed in plan mode.
+  - Later: a separate cheaper model for subagents, and running several explore calls in parallel.
 - ⬜ **Semantic search**: embeddings (NIM / Gemini) in SQLite with a `semantic_search` tool.
 
 ## Phase 6 — Context management ⬜

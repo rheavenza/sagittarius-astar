@@ -152,6 +152,13 @@ func (a *Agent) SetContextBlock(s string) {
 	a.contextBlock = strings.TrimSpace(s)
 }
 
+// contextBlockSnapshot returns the context block (without plan directive).
+func (a *Agent) contextBlockSnapshot() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.contextBlock
+}
+
 // SetMode sets the permission mode (takes effect on the next tool call).
 func (a *Agent) SetMode(m Mode) { a.mode.Store(int32(m)) }
 
@@ -180,7 +187,7 @@ func (a *Agent) PlanMode() bool { return a.planMode.Load() }
 
 // planDirective is appended to the system prompt in plan mode.
 const planDirective = `# Plan mode (active)
-The user enabled plan mode. Investigate as needed with read-only tools (read_file, find_files, search_regex, repo_map, list_directory, map_workspace, web_search, web_fetch), but do NOT modify files, run commands, or call MCP tools — those calls are blocked.
+The user enabled plan mode. Investigate as needed with read-only tools (read_file, find_files, search_regex, repo_map, explore, list_directory, map_workspace, web_search, web_fetch), but do NOT modify files, run commands, or call MCP tools — those calls are blocked.
 Then reply with a concise, numbered implementation plan:
 1. the files you will change and what changes in each,
 2. how you will verify the result (build, tests, manual checks),
@@ -244,6 +251,12 @@ type turn struct {
 
 	planMode     bool
 	checkpointed bool // a checkpoint was taken this turn
+
+	// sub marks an explore subagent turn: it never asks for approval and
+	// only gets toolDefs.
+	sub bool
+	// toolDefs, if non-nil, replaces the normal tool set.
+	toolDefs []llm.Tool
 }
 
 // ensureCheckpoint snapshots the workspace before the first change of the
@@ -324,14 +337,20 @@ func (t *turn) run(ctx context.Context) {
 func (t *turn) stream(ctx context.Context) (text, reasoning string, calls []llm.ToolCall, err error) {
 	pruned := llm.PruneHistory(t.history, t.a.maxTokens)
 	outgoing := WithContextBlock(pruned, t.contextBlock)
-	defs := tools.Definitions()
-	if len(t.a.projectChecks.Checks) > 0 {
-		defs = append(defs, tools.RunChecksDefinition(t.a.projectChecks))
-	}
-	if t.planMode {
-		defs = readOnlyDefs(defs)
-	} else if t.a.mcp != nil {
-		defs = append(defs, t.a.mcp.LLMTools()...)
+	var defs []llm.Tool
+	switch {
+	case t.toolDefs != nil:
+		defs = t.toolDefs
+	default:
+		defs = tools.Definitions()
+		if len(t.a.projectChecks.Checks) > 0 {
+			defs = append(defs, tools.RunChecksDefinition(t.a.projectChecks))
+		}
+		if t.planMode {
+			defs = readOnlyDefs(defs)
+		} else if t.a.mcp != nil {
+			defs = append(defs, t.a.mcp.LLMTools()...)
+		}
 	}
 
 	type result struct {

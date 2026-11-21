@@ -156,6 +156,7 @@ On startup aig builds a context block that is appended to the system prompt of e
 | `edit_file` | Exact replace, `replace_all`, tolerant of whitespace/indentation differences and copied line numbers |
 | `multi_edit` | Several edits to one file, applied atomically with one diff and one confirmation |
 | `repo_map` | Definitions and signatures (with line numbers), grouped by file and ranked by how often they're referenced, cut to a token budget. `dir`, `focus` (paths or symbol names to rank first), `max_tokens` |
+| `explore` | Hands a codebase question to a subagent that starts with a fresh context and has only local read-only tools. Only its answer comes back, so the raw tool output never enters the main context |
 | `run_checks` | Runs the project checks from `.aig/config.json` (only offered when some are configured) |
 
 After each confirmed write aig runs a quick check and returns the result to the model: `go vet` on the package (or `gofmt -e`), `python3 -m py_compile`, `bash -n`, `node --check`, JSON validation. Override or extend per extension:

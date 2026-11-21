@@ -42,6 +42,7 @@ var nativeRisk = map[string]Risk{
 	"find_files":     RiskRead,
 	"map_workspace":  RiskRead,
 	"repo_map":       RiskRead,
+	"explore":        RiskRead, // a subagent limited to RiskRead tools
 	"web_search":     RiskNetwork,
 	"web_fetch":      RiskNetwork,
 	"web_scrape":     RiskNetwork,

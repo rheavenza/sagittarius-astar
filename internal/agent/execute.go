@@ -35,6 +35,9 @@ const deniedToolMsg = "The user denied this tool call. Do not retry it without a
 
 // ask emits an approval request and waits for the answer (or cancellation).
 func (t *turn) ask(ctx context.Context, req *ApprovalRequest) (ApprovalReply, bool) {
+	if t.sub {
+		return ApprovalReply{}, false // subagents can't reach the user
+	}
 	t.emit(ApprovalEvent{Req: req})
 	select {
 	case rep := <-req.reply:
@@ -81,6 +84,18 @@ func (t *turn) execute(ctx context.Context, call llm.ToolCall) outcome {
 	risk, known := tools.RiskOf(call.Name)
 	if !known {
 		return outcome{err: fmt.Errorf("unknown tool: %s", call.Name)}
+	}
+
+	if t.sub {
+		if risk != tools.RiskRead || call.Name == "explore" {
+			return deniedOutcome("Explore subagents may only use local read-only tools.")
+		}
+		if need, reason := tools.NeedsApproval(call, a.workspaceRoot); need {
+			return deniedOutcome("Explore subagents cannot ask the user for approval (" + reason + "). Stay inside the workspace.")
+		}
+	}
+	if call.Name == "explore" {
+		return t.explore(ctx, call)
 	}
 
 	switch risk {
