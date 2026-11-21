@@ -124,15 +124,29 @@ func RenderChecks(source string, checks []Check) string {
 	return b.String()
 }
 
-// BuildContextBlock joins the environment, instruction and checks sections.
-// checks may be "" (see RenderChecks).
-func BuildContextBlock(env Env, files []InstructionFile, checks string) string {
+// RenderRepoMap wraps a rendered repository map for the system prompt.
+func RenderRepoMap(root, repoMap string) string {
+	if strings.TrimSpace(repoMap) == "" {
+		return ""
+	}
+	return "# Repository map\n" +
+		"The most-referenced definitions in " + root + ", computed at session start (it does not update as files change). " +
+		"Use it to decide where to look. Call repo_map (dir, focus) for more symbols with line numbers, and read_file before editing.\n" +
+		"```\n" + strings.TrimSpace(repoMap) + "\n```\n"
+}
+
+// BuildContextBlock joins the environment and the optional sections
+// (instructions, then extra sections such as checks and the repo map; ""
+// entries are skipped).
+func BuildContextBlock(env Env, files []InstructionFile, extra ...string) string {
 	parts := []string{env.Render()}
 	if s := RenderInstructions(files); s != "" {
 		parts = append(parts, s)
 	}
-	if checks != "" {
-		parts = append(parts, checks)
+	for _, s := range extra {
+		if s != "" {
+			parts = append(parts, s)
+		}
 	}
 	return strings.Join(parts, "\n")
 }

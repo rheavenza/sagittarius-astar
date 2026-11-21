@@ -73,18 +73,22 @@ func (pc ProjectChecks) Names() []string {
 }
 
 // CheckNames extracts the "names" argument of a run_checks call.
-func CheckNames(call llm.ToolCall) []string {
+func CheckNames(call llm.ToolCall) []string { return stringList(call.Args["names"]) }
+
+// stringList accepts a JSON array of strings or, as some models send, a
+// comma-separated string.
+func stringList(v any) []string {
 	var out []string
-	switch v := call.Args["names"].(type) {
+	switch v := v.(type) {
 	case []any:
 		for _, x := range v {
 			if s, ok := x.(string); ok && strings.TrimSpace(s) != "" {
-				out = append(out, s)
+				out = append(out, strings.TrimSpace(s))
 			}
 		}
 	case []string:
 		out = v
-	case string: // some models send a comma-separated string
+	case string:
 		for _, s := range strings.Split(v, ",") {
 			if s = strings.TrimSpace(s); s != "" {
 				out = append(out, s)

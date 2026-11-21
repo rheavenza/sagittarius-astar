@@ -87,10 +87,18 @@ Prerequisite for headless mode, subagents and proper tests.
 - ✅ Plan mode: `/plan [task]` offers the model only read-only tools, blocks everything else,
   and asks for a numbered plan. `/go` approves it and starts the implementation.
 
-## Phase 5 — Whole-project understanding ⬜
-- ⬜ **Repo map**: symbols and signatures per file (`go/parser` for Go, `ctags`/tree-sitter for
-  others), ranked by how often they're referenced, fitted to a token budget. Exposed as a tool,
-  and a small version goes into the system prompt.
+## Phase 5 — Whole-project understanding 🚧
+- ✅ **Repo map** (`internal/repomap`): symbols and signatures per file, fitted to a token
+  budget. Exposed as the `repo_map` tool (`dir`, `focus`, `max_tokens`); a version of about 1,000
+  tokens goes into the system prompt in git repos.
+  - Go is parsed with `go/parser`. References are scoped: `pkg.Name` from other packages, bare
+    names inside the package, `.Method` for methods.
+  - Python, JS/TS, Rust and shell use line patterns. They're ranked by how many files mention a
+    name, and short generic names are discounted.
+  - Generated files, vendored folders, test files and minified bundles rank low or are skipped.
+  - The parse cache is keyed by mtime and size. The Go standard library (7k files) maps in about
+    0.4 s cold and 20 ms cached.
+  - Possible later improvement: tree-sitter for exact non-Go parsing.
 - ⬜ **`/summarize`**: map-reduce summaries (file → folder → project) on a cheap model, cached
   by content hash in `~/.cache/aig/index/<repo>/`, so re-runs only cost the changed files.
   Produces `PROJECT_SUMMARY.md` plus a `project_overview` tool.

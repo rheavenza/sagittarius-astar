@@ -145,6 +145,7 @@ On first launch, `aig` generates a default `config.json` at:
 On startup aig builds a context block that is appended to the system prompt of every request (never stored in the session):
 - **Environment**: working dir, git root and branch, OS (with Bazzite/ostree hints), date, detected stack (`go.mod`, `package.json`, …), and useful CLI tools on PATH.
 - **Instruction files**: `AGENTS.md`, `CLAUDE.md`, `.aig/instructions.md` in the working directory and the git root (each needs one-time consent, re-asked when the file changes), plus your global `~/.config/aig/AGENTS.md` (always trusted).
+- **Repository map** (git repos only): the most-referenced definitions in the repo, about 1,000 tokens. It's built in the background at startup and skipped if it isn't ready within 3 s. Set the size with `"repo_map_tokens": 2048`, or turn it off with `-1`.
 
 ### Coding tools
 | Tool | What it does |
@@ -154,6 +155,7 @@ On startup aig builds a context block that is appended to the system prompt of e
 | `search_regex` | ripgrep when installed, Go fallback; `.gitignore`-aware, skips binaries and dependency/build dirs (`node_modules`, `vendor`, `target`, …), `case_insensitive` |
 | `edit_file` | Exact replace, `replace_all`, tolerant of whitespace/indentation differences and copied line numbers |
 | `multi_edit` | Several edits to one file, applied atomically with one diff and one confirmation |
+| `repo_map` | Definitions and signatures (with line numbers), grouped by file and ranked by how often they're referenced, cut to a token budget. `dir`, `focus` (paths or symbol names to rank first), `max_tokens` |
 | `run_checks` | Runs the project checks from `.aig/config.json` (only offered when some are configured) |
 
 After each confirmed write aig runs a quick check and returns the result to the model: `go vet` on the package (or `gofmt -e`), `python3 -m py_compile`, `bash -n`, `node --check`, JSON validation. Override or extend per extension:
@@ -264,6 +266,7 @@ internal/tools     native tools, edit matching, post-edit checks, risk levels
 internal/tui       Bubble Tea front-end: renders events, answers approvals
 internal/llm       providers (Gemini, OpenAI-compatible DeepSeek / NVIDIA NIM), pruning, <think> splitting
 internal/prompt    environment block + AGENTS.md / CLAUDE.md instructions
+internal/repomap   repository map: Go via go/parser, Python/JS/TS/Rust/shell via line patterns, reference ranking
 internal/sandbox   command execution (process groups, output caps, askpass sudo)
 internal/mcp       MCP host (stdio servers, namespaced tools)
 internal/config    config file, personas, provider endpoints, prompt trust store

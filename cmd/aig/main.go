@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 	"github.com/clitorhea/sagittarius-astar.git/internal/mcp"
 	"github.com/clitorhea/sagittarius-astar.git/internal/prompt"
+	"github.com/clitorhea/sagittarius-astar.git/internal/repomap"
 	"github.com/clitorhea/sagittarius-astar.git/internal/session"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tools"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tui"
@@ -143,6 +145,10 @@ func runChat(_ *cobra.Command, _ []string) error {
 		fmt.Fprintf(os.Stderr, "warning: logging disabled: %v\n", err)
 	}
 	defer cleanupLog()
+
+	// Build the repo map in the background while config, consent prompts
+	// and MCP servers start up.
+	repoMapSection := startRepoMap()
 
 	// ── Local ./aig.md prompt (requires one-time consent per content hash) ───
 	if flagPersona == "" {
@@ -285,7 +291,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 		Provider:       provider,
 		MCP:            mcpRegistry,
 		WorkspaceRoot:  cwd,
-		ContextBlock:   buildContextBlock(cwd, env, checksSection),
+		ContextBlock:   buildContextBlock(cwd, env, checksSection, repoMapSection()),
 		PostEditChecks: fc.PostEditChecks,
 		ProjectChecks:  projectChecks,
 	})
@@ -341,7 +347,7 @@ func resolveLocalPrompt() string {
 // .aig/instructions.md in cwd and the git root, plus the user's global
 // ~/.config/aig/AGENTS.md) and joins them with the environment and the
 // project checks section. Repo files need consent.
-func buildContextBlock(cwd string, env prompt.Env, checksSection string) string {
+func buildContextBlock(cwd string, env prompt.Env, sections ...string) string {
 
 	var files []prompt.InstructionFile
 	if g := prompt.GlobalInstructionFile(filepath.Dir(config.Path())); g != "" {
@@ -358,7 +364,64 @@ func buildContextBlock(cwd string, env prompt.Env, checksSection string) string 
 		}
 	}
 	logger.L.Info("context block built", "git_root", env.GitRoot, "instruction_files", len(files))
-	return prompt.BuildContextBlock(env, files, checksSection)
+	return prompt.BuildContextBlock(env, files, sections...)
+}
+
+// repoMapStartupTimeout bounds the startup repo map; on a huge repo the
+// prompt simply goes without it (the repo_map tool still works).
+const repoMapStartupTimeout = 3 * time.Second
+
+// startRepoMap builds the system-prompt repository map in the background
+// (git repos only, so aig started in $HOME doesn't crawl it) and returns a
+// function that waits for the rendered section ("" if off, failed or slow).
+func startRepoMap() func() string {
+	budget := config.LoadFileConfig().RepoMapTokens
+	if budget < 0 {
+		return func() string { return "" }
+	}
+	if budget == 0 {
+		budget = 1024
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return func() string { return "" }
+	}
+	ch := make(chan string, 1)
+	start := time.Now()
+	go func() {
+		root := gitRoot(cwd)
+		if root == "" {
+			ch <- ""
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), repoMapStartupTimeout)
+		defer cancel()
+		m, err := repomap.Build(ctx, root)
+		if err != nil {
+			logger.L.Warn("repo map skipped", "root", root, "error", err)
+			ch <- ""
+			return
+		}
+		files, syms := m.Stats()
+		logger.L.Info("repo map built", "root", root, "files", files, "symbols", syms, "took", time.Since(start))
+		ch <- prompt.RenderRepoMap(root, m.Render(repomap.Options{MaxTokens: budget}))
+	}()
+	return func() string {
+		select {
+		case s := <-ch:
+			return s
+		case <-time.After(repoMapStartupTimeout + time.Second):
+			return ""
+		}
+	}
+}
+
+func gitRoot(dir string) string {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // loadProjectChecks reads .aig/config.json (cwd, then git root) after

@@ -2,6 +2,8 @@ package tools
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -63,5 +65,27 @@ func TestHeadTailKeepsBothEnds(t *testing.T) {
 	got := headTail(s, 100, 100)
 	if !strings.HasPrefix(got, "HEAD") || !strings.HasSuffix(got, "TAIL") || !strings.Contains(got, "bytes omitted") {
 		t.Errorf("headTail = %q", got)
+	}
+}
+
+func TestRepoMapTool(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc RunServer(port int) error { return nil }\n"), 0o644)
+
+	out, pw, err := Execute(llm.ToolCall{Name: "repo_map", Args: map[string]any{"dir": dir, "focus": "main.go", "max_tokens": float64(500)}})
+	if err != nil || pw != nil {
+		t.Fatalf("err=%v pw=%v", err, pw)
+	}
+	for _, want := range []string{"1 source files", "Focus: main.go", "main.go:", "3  func RunServer(port int) error"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	if r, ok := RiskOf("repo_map"); !ok || r != RiskRead {
+		t.Error("repo_map must be read-only")
+	}
+	if need, _ := NeedsApproval(llm.ToolCall{Name: "repo_map", Args: map[string]any{"dir": "/etc"}}, dir); !need {
+		t.Error("repo_map outside the workspace must ask")
 	}
 }

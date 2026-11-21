@@ -180,7 +180,7 @@ func (a *Agent) PlanMode() bool { return a.planMode.Load() }
 
 // planDirective is appended to the system prompt in plan mode.
 const planDirective = `# Plan mode (active)
-The user enabled plan mode. Investigate as needed with read-only tools (read_file, find_files, search_regex, list_directory, map_workspace, web_search, web_fetch), but do NOT modify files, run commands, or call MCP tools — those calls are blocked.
+The user enabled plan mode. Investigate as needed with read-only tools (read_file, find_files, search_regex, repo_map, list_directory, map_workspace, web_search, web_fetch), but do NOT modify files, run commands, or call MCP tools — those calls are blocked.
 Then reply with a concise, numbered implementation plan:
 1. the files you will change and what changes in each,
 2. how you will verify the result (build, tests, manual checks),

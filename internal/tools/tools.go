@@ -275,6 +275,31 @@ Prefer specific, targeted commands. Avoid commands that start interactive sessio
 				},
 			},
 		},
+		// ── repo_map ─────────────────────────────────────────────────────────
+		{
+			Name: "repo_map",
+			Description: "Map a codebase's definitions: functions, types, classes and their signatures with line numbers, grouped by file and ranked by how often they are referenced, cut to a token budget. " +
+				"Use it to find the important code and the right file before reading. Go is parsed exactly; Python, JS/TS, Rust and shell by line patterns. " +
+				"Pass focus to boost files or symbols you care about.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"dir": map[string]any{
+						"type":        "string",
+						"description": "Directory to map (default: .). Narrow it for big repos.",
+					},
+					"focus": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "File paths (or path fragments like 'internal/agent') and symbol names to rank first.",
+					},
+					"max_tokens": map[string]any{
+						"type":        "integer",
+						"description": "Output budget in tokens (default 4096, max 16384).",
+					},
+				},
+			},
+		},
 		// ── web_search ───────────────────────────────────────────────────────
 		{
 			Name:        "web_search",
@@ -497,6 +522,10 @@ func Execute(call llm.ToolCall) (result string, pw *PendingWrite, err error) {
 			return "", nil, err
 		}
 		return tree, nil, nil
+
+	// ── repo_map ─────────────────────────────────────────────────────────────
+	case "repo_map":
+		return repoMap(call)
 
 	// ── web_search ───────────────────────────────────────────────────────────
 	case "web_search":
@@ -778,6 +807,7 @@ var toolPathArgs = map[string][2]string{
 	"search_regex":   {"dir", "."},
 	"find_files":     {"dir", "."},
 	"map_workspace":  {"dir", "."},
+	"repo_map":       {"dir", "."},
 }
 
 // NeedsApproval decides whether a native (non run_command,

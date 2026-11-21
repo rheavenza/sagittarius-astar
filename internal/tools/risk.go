@@ -41,6 +41,7 @@ var nativeRisk = map[string]Risk{
 	"search_regex":   RiskRead,
 	"find_files":     RiskRead,
 	"map_workspace":  RiskRead,
+	"repo_map":       RiskRead,
 	"web_search":     RiskNetwork,
 	"web_fetch":      RiskNetwork,
 	"web_scrape":     RiskNetwork,

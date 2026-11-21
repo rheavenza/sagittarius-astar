@@ -78,3 +78,17 @@ func TestRenderChecks(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderRepoMapAndContextBlock(t *testing.T) {
+	if RenderRepoMap("/r", "  ") != "" {
+		t.Error("empty map should render nothing")
+	}
+	s := RenderRepoMap("/r", "a.go:\n  func A()")
+	if !strings.Contains(s, "# Repository map") || !strings.Contains(s, "```\na.go:\n  func A()\n```") || !strings.Contains(s, "repo_map") {
+		t.Errorf("section = %q", s)
+	}
+	block := BuildContextBlock(Env{Cwd: "/r"}, nil, "", s)
+	if !strings.Contains(block, "# Environment") || !strings.Contains(block, "# Repository map") || strings.Contains(block, "\n\n\n\n") {
+		t.Errorf("block = %q", block)
+	}
+}

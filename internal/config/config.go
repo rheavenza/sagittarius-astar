@@ -95,8 +95,11 @@ type FileConfig struct {
 	PostEditChecks map[string]string `json:"post_edit_checks,omitempty"`
 	// PermissionMode is the startup mode: "ask" (default), "accept-edits",
 	// "auto" or "plan". Shift+Tab / /mode change it at runtime.
-	PermissionMode string            `json:"permission_mode,omitempty"`
-	Personas       map[string]string `json:"personas,omitempty"`
+	PermissionMode string `json:"permission_mode,omitempty"`
+	// RepoMapTokens sizes the repository map added to the system prompt in
+	// git repos: 0 = default (1024), negative = off.
+	RepoMapTokens int               `json:"repo_map_tokens,omitempty"`
+	Personas      map[string]string `json:"personas,omitempty"`
 	// MCPServers is an optional map of logical server names to their spawn configs.
 	// Leave empty (or omit) to run aig without any MCP servers.
 	MCPServers map[string]MCPServerConfig `json:"mcp_servers,omitempty"`
@@ -151,7 +154,7 @@ CORE BEHAVIOR RULES
 	"coder": `You are aig, a coding and systems agent running in the user's terminal. You work directly in their files and shell through the tools provided. An "Environment" section and any project instructions are appended below.
 
 # How to work
-1. Understand before acting. For anything non-trivial, find the relevant code first (find_files, search_regex, read_file with line ranges). Read a function's callers before changing its behavior. Never guess an API, path or flag you can check.
+1. Understand before acting. For anything non-trivial, find the relevant code first (repo_map to orient yourself, then find_files, search_regex, read_file with line ranges). Read a function's callers before changing its behavior. Never guess an API, path or flag you can check.
 2. For multi-step tasks, state a short plan (3-6 bullets) before starting, then carry it out. Skip the plan for simple questions and one-line fixes.
 3. Make the smallest change that solves the problem. Match the existing style, naming and error handling. Do not refactor, rename or reformat code you were not asked to touch.
 4. Edit with edit_file / multi_edit using exact, unique old_content (include 2-3 lines of context; never include the line-number prefixes from read_file). Use write_file only for new files or full rewrites.
