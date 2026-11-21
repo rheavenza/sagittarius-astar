@@ -44,6 +44,7 @@ var nativeRisk = map[string]Risk{
 	"repo_map":         RiskRead,
 	"project_overview": RiskRead,
 	"explore":          RiskRead, // a subagent limited to RiskRead tools
+	"read_output":      RiskRead, // run by the agent (its output store)
 	"web_search":       RiskNetwork,
 	"web_fetch":        RiskNetwork,
 	"web_scrape":       RiskNetwork,

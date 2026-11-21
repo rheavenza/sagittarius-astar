@@ -58,3 +58,22 @@ func TestEstimateCountsToolArgs(t *testing.T) {
 		t.Fatalf("tool-call args not counted: %d", EstimateMessageTokens(m))
 	}
 }
+
+func TestContextWindow(t *testing.T) {
+	cases := map[string]int{
+		"gemini-2.5-flash":            1_048_576,
+		"deepseek-v4-pro":             131_072,
+		"meta/llama-3.3-70b-instruct": 131_072,
+		"meta/llama3-70b-instruct":    8_192,
+		"mistralai/mistral-7b":        32_768, // longest prefix wins over "mistralai/"
+		"someone/unknown-model":       DefaultContextWindow,
+	}
+	for model, want := range cases {
+		if got := ContextWindow(model, nil); got != want {
+			t.Errorf("%s: %d, want %d", model, got, want)
+		}
+	}
+	if got := ContextWindow("someone/unknown-model", map[string]int{"someone/unknown-model": 200_000}); got != 200_000 {
+		t.Errorf("override ignored: %d", got)
+	}
+}

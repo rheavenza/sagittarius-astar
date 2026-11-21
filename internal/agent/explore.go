@@ -37,7 +37,11 @@ const exploreLimitMsg = "You have reached the exploration limit. Do not call mor
 // tools, without explore itself (no recursion).
 func (a *Agent) exploreDefs() []llm.Tool {
 	var out []llm.Tool
-	for _, d := range append(tools.Definitions(), a.indexDefs()...) {
+	defs := append(tools.Definitions(), a.indexDefs()...)
+	if !a.outputs.empty() {
+		defs = append(defs, readOutputDefinition())
+	}
+	for _, d := range defs {
 		if r, ok := tools.RiskOf(d.Name); ok && r == tools.RiskRead && d.Name != "explore" {
 			out = append(out, d)
 		}

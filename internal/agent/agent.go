@@ -24,7 +24,8 @@ import (
 )
 
 const (
-	// DefaultMaxContextTokens is the default history budget per request.
+	// DefaultMaxContextTokens is the context window assumed until
+	// SetContextWindow is called.
 	DefaultMaxContextTokens = 100_000
 	// MaxToolRounds bounds model↔tool round trips in a single turn.
 	MaxToolRounds = 50
@@ -42,7 +43,9 @@ type Options struct {
 	PostEditChecks map[string]string
 	// ProjectChecks is the project's definition of done (.aig/config.json);
 	// when it has checks, the run_checks tool is offered.
-	ProjectChecks    tools.ProjectChecks
+	ProjectChecks tools.ProjectChecks
+	// MaxContextTokens fixes the context window (tests); 0 = use
+	// SetContextWindow / DefaultMaxContextTokens.
 	MaxContextTokens int
 	// Checkpoints, if set, snapshots the workspace before the first change
 	// of each turn (write, command, or MCP call) so it can be undone.
@@ -69,7 +72,8 @@ type Agent struct {
 	postEditChecks map[string]string
 	projectChecks  tools.ProjectChecks
 	summaryRoot    string // repo root whose /summarize index project_overview reads
-	maxTokens      int
+	budget         budget
+	outputs        outputStore
 	checkpoints    Checkpointer
 
 	mode     atomic.Int32 // Mode
@@ -117,9 +121,6 @@ func ParseMode(s string) (Mode, bool) {
 
 // New creates an Agent.
 func New(o Options) *Agent {
-	if o.MaxContextTokens <= 0 {
-		o.MaxContextTokens = DefaultMaxContextTokens
-	}
 	return &Agent{
 		provider:       o.Provider,
 		contextBlock:   strings.TrimSpace(o.ContextBlock),
@@ -128,7 +129,7 @@ func New(o Options) *Agent {
 		postEditChecks: o.PostEditChecks,
 		projectChecks:  o.ProjectChecks,
 		summaryRoot:    summaryRootFor(o.WorkspaceRoot),
-		maxTokens:      o.MaxContextTokens,
+		budget:         budget{override: o.MaxContextTokens},
 		checkpoints:    o.Checkpoints,
 	}
 }
@@ -204,7 +205,9 @@ func (a *Agent) SetPlanMode(on bool) { a.planMode.Store(on) }
 // PlanMode reports whether plan mode is on.
 func (a *Agent) PlanMode() bool { return a.planMode.Load() }
 
-// planDirective is appended to the system prompt in plan mode.
+// planDirective is sent as a trailing note on every request in plan mode.
+// It is not part of the system prompt, so toggling plan mode doesn't change
+// the prompt prefix and providers' prompt caches stay valid.
 const planDirective = `# Plan mode (active)
 The user enabled plan mode. Investigate as needed with read-only tools (read_file, find_files, search_regex, repo_map, explore, list_directory, map_workspace, web_search, web_fetch), but do NOT modify files, run commands, or call MCP tools — those calls are blocked.
 Then reply with a concise, numbered implementation plan:
@@ -241,7 +244,7 @@ func (a *Agent) Run(ctx context.Context, history []llm.Message) <-chan Event {
 		planMode:     a.planMode.Load(),
 	}
 	if t.planMode {
-		t.contextBlock = strings.TrimSpace(t.contextBlock + "\n\n" + planDirective)
+		t.tailNote = planDirective
 	}
 	a.mu.Unlock()
 
@@ -268,8 +271,11 @@ type turn struct {
 	sameCount          int
 	errCount           int
 
-	planMode     bool
-	checkpointed bool // a checkpoint was taken this turn
+	planMode      bool
+	tailNote      string // appended to each request as a final system note (not stored)
+	checkpointed  bool   // a checkpoint was taken this turn
+	compactFailed bool   // a summary request failed: don't retry this turn
+	compactWarned bool   // "nothing to compact" was reported this turn
 
 	// sub marks an explore subagent turn: it never asks for approval and
 	// only gets toolDefs.
@@ -354,8 +360,6 @@ func (t *turn) run(ctx context.Context) {
 
 // stream sends the conversation to the model and relays tokens.
 func (t *turn) stream(ctx context.Context) (text, reasoning string, calls []llm.ToolCall, err error) {
-	pruned := llm.PruneHistory(t.history, t.a.maxTokens)
-	outgoing := WithContextBlock(pruned, t.contextBlock)
 	var defs []llm.Tool
 	switch {
 	case t.toolDefs != nil:
@@ -370,7 +374,17 @@ func (t *turn) stream(ctx context.Context) (text, reasoning string, calls []llm.
 		} else if t.a.mcp != nil {
 			defs = append(defs, t.a.mcp.LLMTools()...)
 		}
+		if !t.a.outputs.empty() {
+			defs = append(defs, readOutputDefinition())
+		}
 	}
+	outgoing := t.fitContext(ctx, defs)
+	if t.tailNote != "" {
+		// Dynamic instructions go last, after the cacheable prefix.
+		outgoing = append(outgoing, llm.Message{Role: llm.RoleSystem, Content: t.tailNote})
+	}
+	rawEstimate := llm.EstimateHistoryTokens(outgoing) + defsTokens(defs)
+	var usage llm.Usage
 
 	type result struct {
 		calls     []llm.ToolCall
@@ -380,7 +394,7 @@ func (t *turn) stream(ctx context.Context) (text, reasoning string, calls []llm.
 	tokenCh := make(chan string, 64)
 	done := make(chan result, 1)
 	go func() {
-		c, r, e := t.provider.StreamChat(ctx, outgoing, defs, tokenCh)
+		c, r, e := t.provider.StreamChat(llm.WithUsage(ctx, &usage), outgoing, defs, tokenCh)
 		done <- result{c, r, e}
 	}()
 
@@ -400,6 +414,17 @@ func (t *turn) stream(ctx context.Context) (text, reasoning string, calls []llm.
 	split.Flush()
 	if res.err != nil {
 		return "", "", nil, res.err
+	}
+	if usage.InputTokens > 0 {
+		t.a.budget.calibrate(rawEstimate, usage.InputTokens)
+	}
+	if !t.sub {
+		window, factor := t.a.budget.get()
+		est := usage
+		if est.InputTokens == 0 {
+			est.InputTokens = int(float64(rawEstimate) * factor) // provider didn't report
+		}
+		t.emit(UsageEvent{Usage: est, Reported: usage.InputTokens > 0, Window: window})
 	}
 
 	// Reasoning the provider returned must be stored verbatim (DeepSeek
@@ -440,14 +465,14 @@ func (t *turn) runCalls(ctx context.Context, calls []llm.ToolCall) bool {
 				content = "Aborted by user."
 			}
 			t.emit(ToolResultEvent{Call: call, Result: out.result, Err: out.err, Denied: out.denied})
-			t.appendToolResult(call, content)
+			t.appendToolResult(call, t.a.shrinkOutput(call.Name, content))
 			t.answer(calls[i+1:], "Aborted by user before execution.")
 			t.emit(DoneEvent{Aborted: true})
 			return true
 		}
 
 		t.emit(ToolResultEvent{Call: call, Result: out.result, Err: out.err, Denied: out.denied})
-		t.appendToolResult(call, out.content())
+		t.appendToolResult(call, t.a.shrinkOutput(call.Name, out.content()))
 
 		if out.err != nil {
 			t.errCount++

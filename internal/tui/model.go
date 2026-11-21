@@ -100,6 +100,7 @@ type Model struct {
 	// checkpoints backs /undo, /redo, /diff (nil if unavailable).
 	checkpoints *checkpoint.Manager
 	summary     *summaryJob // running /summarize, or nil
+	compacting  bool        // /compact in progress
 
 	// providerFingerprint is provider|model|baseURL|apiKey of the live
 	// provider, so the client is only rebuilt when one of those changes.
@@ -133,6 +134,10 @@ type Model struct {
 
 	// tokenEstimate caches the history size shown in the status bar.
 	tokenEstimate int
+	// ctxUsed / ctxWindow: context use of the last request (UsageEvent);
+	// ctxReported is false when the provider gave no counts (estimate).
+	ctxUsed, ctxWindow int
+	ctxReported        bool
 
 	// Glamour renderer
 	renderer *glamour.TermRenderer
@@ -283,6 +288,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						"/approve-tools",
 						"/checkpoints",
 						"/clear",
+						"/compact",
 						"/diff",
 						"/go",
 						"/delete",
@@ -381,6 +387,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						m.appendOutput("  /plan [task]       Plan mode: read-only investigation, then a plan (/plan off to exit)")
 						m.appendOutput("  /go                Approve the plan and implement it")
 						m.appendOutput("  /summarize [go|stop|show]  Cached project summary (preview cost, run, cancel, view)")
+						m.appendOutput("  /compact           Summarize the conversation so far to free context (automatic at ~80%)")
 						m.appendOutput("  /quit, /q          Exit the application")
 						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Keyboard shortcuts:"))
 						m.appendOutput("  Enter              Send message")
@@ -722,6 +729,9 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 						break
 					}
 
+					if nm, cmd, ok := m.handleCompactCommand(input); ok {
+						return nm, cmd
+					}
 					if nm, cmd, ok := m.handleSummarizeCommand(input); ok {
 						return nm, cmd
 					}
@@ -874,6 +884,9 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 
 	case summaryProgressMsg, summaryDoneMsg:
 		return m.handleSummaryMsg(msg)
+
+	case compactDoneMsg:
+		return m.handleCompactDone(msg)
 
 	case agentClosedMsg:
 		// The channel closes right after DoneEvent; nothing else to do unless
@@ -1129,6 +1142,14 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 			continue
 		}
 
+		if msg.Role == llm.RoleUser && strings.HasPrefix(msg.Content, agent.CompactedPrefix) {
+			m.outputLines = append(m.outputLines,
+				systemLabelStyle.Render("📦 Earlier conversation (compacted)"),
+				lipgloss.NewStyle().Foreground(colorSubtext).Render(strings.TrimSpace(strings.TrimPrefix(msg.Content, agent.CompactedPrefix))),
+				m.convDivider(),
+			)
+			continue
+		}
 		if msg.Role == llm.RoleUser {
 			label := userLabelStyle.Render("You")
 			m.outputLines = append(m.outputLines,
@@ -1363,6 +1384,7 @@ func helpOverlay() string {
 		"  /plan [task]        Plan mode (read-only), then /go to implement",
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  Project index"),
 		"  /summarize          Preview; /summarize go builds the project summary",
+		"  /compact            Summarize older turns to free context",
 		lipgloss.NewStyle().Foreground(colorAccent).Render("  File macros"),
 		"  /read(path)     Attach file content to next message",
 	}

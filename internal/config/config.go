@@ -102,8 +102,11 @@ type FileConfig struct {
 	// SummaryModel is the model /summarize uses for its many small requests:
 	// "provider:model" (e.g. "deepseek:deepseek-v4-flash") or a model of the
 	// session's provider. Empty = the session's model.
-	SummaryModel string            `json:"summary_model,omitempty"`
-	Personas     map[string]string `json:"personas,omitempty"`
+	SummaryModel string `json:"summary_model,omitempty"`
+	// ContextWindows overrides the built-in context window (tokens) per
+	// exact model id, e.g. {"moonshotai/kimi-k3": 262144}.
+	ContextWindows map[string]int    `json:"context_windows,omitempty"`
+	Personas       map[string]string `json:"personas,omitempty"`
 	// MCPServers is an optional map of logical server names to their spawn configs.
 	// Leave empty (or omit) to run aig without any MCP servers.
 	MCPServers map[string]MCPServerConfig `json:"mcp_servers,omitempty"`

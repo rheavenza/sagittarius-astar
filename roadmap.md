@@ -122,11 +122,25 @@ Prerequisite for headless mode, subagents and proper tests.
   `semantic_search` tool. Revisit after Phase 6, once there's real usage data for
   `repo_map` + `explore` + `project_overview`.
 
-## Phase 6 — Context management ⬜
-- ⬜ Real token usage from API responses, plus a context-window table per model.
-- ⬜ Compaction: summarize old turns at about 80% of the window instead of dropping them.
-- ⬜ Large tool outputs are stored and referenced by ID; a tool fetches more on demand.
-- ⬜ Prompt-cache-friendly layout: stable prefix, dynamic content only at the end.
+## Phase 6 — Context management ✅
+- ✅ **Real token usage**: providers report it through `llm.WithUsage(ctx, &u)` (OpenAI-compatible
+  via `stream_options.include_usage`, Gemini via `UsageMetadata`), so the `Provider` interface
+  didn't change. There's a context-window table per model, with `context_windows` overrides in
+  config. Token estimates are calibrated against the real counts.
+- ✅ **Status bar**: shows `ctx 34% (45k/131k)`, with `~` when it's an estimate and yellow from 70%.
+- ✅ **Compaction**: at 80% of the window, older turns are summarized and replaced by a summary
+  message plus an ack; the most recent ~35% of the window is kept word for word.
+  - The TUI adopts the new history (`HistoryEvent`) and saves the session.
+  - When a single long turn fills the context, its old tool outputs are shortened instead,
+    oldest first.
+  - If the summary request fails, aig warns and falls back to dropping the oldest turns.
+  - `/compact` does the same on demand.
+- ✅ **Large tool outputs** (>16 KB) are stored per session. The history keeps the first and
+  last 3 KB plus an ID, and `read_output(id, start_line/end_line | pattern)` fetches the rest.
+- ✅ **Prompt-cache-friendly layout**: the system prompt and context block are fixed for the
+  session. The plan-mode instructions are now sent as a note at the end of each request, so
+  toggling `/plan` doesn't change the prompt prefix. Compaction at 80% means the old
+  per-request pruning, which changed the prefix every time, rarely kicks in.
 
 ## Phase 7 — Workflow & UX ⬜
 - ⬜ Headless mode: `aig -p "…"`, stdin piping (`git diff | aig -p "commit message"`).

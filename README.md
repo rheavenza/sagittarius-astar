@@ -165,6 +165,14 @@ After each confirmed write aig runs a quick check and returns the result to the 
 "post_edit_checks": { ".ts": "npx tsc --noEmit -p {dir}", ".py": "off" }
 ```
 
+### Context management
+- **Status bar:** shows how much of the model's context window the last request used, e.g. `ctx 34% (45k/131k)`. The numbers come from the API when the provider reports them; `~` marks an estimate.
+- **Windows:** context windows come from a built-in table. Override them with `"context_windows": {"moonshotai/kimi-k3": 262144}`.
+- **Automatic compaction:** at about 80% of the window, aig summarizes the older turns with the current model and keeps the recent ones word for word. A 📦 notice shows the before/after size.
+  - If a single long turn fills the context, its older large tool outputs are shortened instead.
+  - `/compact` does it on demand.
+- **Large tool outputs** (over 16 KB) stay out of the conversation. The model sees the first and last 3 KB plus an ID, and fetches the rest with `read_output` (a line range or a regex).
+
 ### Project summary (`/summarize`)
 - `/summarize` only previews: how many source files, how many are already cached, an estimated token count, and which model would be used.
 - `/summarize go` builds the summary in the background while you keep working. A cheap model writes 2–4 sentences per file, then a paragraph per folder, then a project overview.

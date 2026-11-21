@@ -530,3 +530,39 @@ func TestTUISummarizePreviewRunAndShow(t *testing.T) {
 		t.Errorf("show:\n%s", output(d.m))
 	}
 }
+
+func TestTUICompactCommand(t *testing.T) {
+	d := newDriver(t, &fakeProvider{})
+	for i := 0; i < 3; i++ {
+		d.m.history = append(d.m.history,
+			llm.Message{Role: llm.RoleUser, Content: fmt.Sprintf("question %d", i)},
+			llm.Message{Role: llm.RoleAssistant, Content: fmt.Sprintf("answer %d", i)})
+	}
+	d.submit("/compact")
+	d.runUntil("compacted", func(m Model) bool { return strings.Contains(output(m), "✓ Compacted") })
+
+	h := d.m.history
+	if len(h) != 5 || !strings.HasPrefix(h[1].Content, agent.CompactedPrefix) || h[3].Content != "question 2" || h[4].Content != "answer 2" {
+		t.Fatalf("history after /compact = %+v", h)
+	}
+	if !strings.Contains(output(d.m), "📦 Earlier conversation (compacted)") {
+		t.Errorf("compacted summary not rendered:\n%s", output(d.m))
+	}
+	saved, err := session.Load("test-session")
+	if err != nil || len(saved.History) != 5 {
+		t.Errorf("compacted history not saved: %v", err)
+	}
+}
+
+func TestStatusBarShowsContextUse(t *testing.T) {
+	d := newDriver(t, &fakeProvider{})
+	d.m.ctxUsed, d.m.ctxWindow, d.m.ctxReported = 92_000, 131_072, true
+	bar := reANSI.ReplaceAllString(d.m.statusBar(), "")
+	if !strings.Contains(bar, "ctx 70% (92k/131k)") {
+		t.Errorf("status bar = %q", bar)
+	}
+	d.m.ctxReported = false
+	if bar := reANSI.ReplaceAllString(d.m.statusBar(), ""); !strings.Contains(bar, "ctx ~70%") {
+		t.Errorf("estimated usage not marked: %q", bar)
+	}
+}

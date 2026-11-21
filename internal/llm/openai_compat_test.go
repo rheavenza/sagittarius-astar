@@ -167,3 +167,33 @@ func TestNIMRequiresModel(t *testing.T) {
 		t.Fatal("expected an error for an empty model")
 	}
 }
+
+func TestUsageReportedAfterToolCalls(t *testing.T) {
+	sse := []string{
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`{"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":30,"total_tokens":1230,"prompt_tokens_details":{"cached_tokens":1024}}}`,
+	}
+	var body map[string]any
+	srv := fakeOpenAIServer(t, sse, &body)
+	defer srv.Close()
+
+	p, _ := NewNIMProvider("", "m", srv.URL)
+	var u Usage
+	ch := make(chan string, 16)
+	calls, _, err := p.StreamChat(WithUsage(context.Background(), &u), []Message{{Role: RoleUser, Content: "hi"}}, []Tool{{Name: "read_file", Parameters: map[string]any{"type": "object"}}}, ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(ch)
+	if len(calls) != 1 || calls[0].Name != "read_file" || calls[0].Args["path"] != "a" {
+		t.Fatalf("calls = %+v", calls)
+	}
+	if u != (Usage{InputTokens: 1200, OutputTokens: 30, CachedTokens: 1024}) {
+		t.Errorf("usage = %+v", u)
+	}
+	opts, _ := body["stream_options"].(map[string]any)
+	if opts["include_usage"] != true {
+		t.Errorf("stream_options = %v", body["stream_options"])
+	}
+}

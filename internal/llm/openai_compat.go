@@ -167,6 +167,8 @@ func (d *OpenAICompatProvider) StreamChat(ctx context.Context, messages []Messag
 		Model:    d.model,
 		Messages: oaiMessages,
 		Stream:   true,
+		// The last chunk then carries token usage (empty choices).
+		StreamOptions: &openai.StreamOptions{IncludeUsage: true},
 	}
 
 	// tool_choice is only valid when tools are supplied; OpenAI-compatible
@@ -229,17 +231,30 @@ func (d *OpenAICompatProvider) StreamChat(ctx context.Context, messages []Messag
 	// These arrive in Delta.ReasoningContent before regular content tokens.
 	var reasoningBuf strings.Builder
 
+	// toolsDone: finish_reason was tool_calls. Keep reading to EOF anyway,
+	// because the usage chunk comes after it.
+	toolsDone := false
 	for {
 		resp, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
+			if toolsDone {
+				break // the calls are complete; a late error only loses usage
+			}
 			logger.L.Error(d.name+": stream recv error", "error", err)
 			return nil, "", fmt.Errorf("%s: stream error: %w", d.name, err)
 		}
+		if u := resp.Usage; u != nil {
+			usage := Usage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens}
+			if u.PromptTokensDetails != nil {
+				usage.CachedTokens = u.PromptTokensDetails.CachedTokens
+			}
+			ReportUsage(ctx, usage)
+		}
 
-		if len(resp.Choices) == 0 {
+		if len(resp.Choices) == 0 || toolsDone {
 			continue
 		}
 
@@ -282,12 +297,8 @@ func (d *OpenAICompatProvider) StreamChat(ctx context.Context, messages []Messag
 		}
 
 		if choice.FinishReason == openai.FinishReasonToolCalls {
-			calls := collectCalls()
-			logger.L.Debug(d.name+": tool calls received", "count", len(calls))
-			// Return reasoning content alongside the tool calls so the caller
-			// can atomically store it in the assistant message. This avoids any
-			// race between the token channel and the toolCallBatchMsg.
-			return calls, reasoningBuf.String(), nil
+			toolsDone = true
+			continue
 		}
 
 		delta := choice.Delta.Content

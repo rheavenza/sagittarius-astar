@@ -93,6 +93,13 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 			return nil, "", fmt.Errorf("gemini: stream error: %w", err)
 		}
 
+		if u := resp.UsageMetadata; u != nil {
+			ReportUsage(ctx, Usage{
+				InputTokens:  int(u.PromptTokenCount + u.ToolUsePromptTokenCount),
+				OutputTokens: int(u.CandidatesTokenCount + u.ThoughtsTokenCount),
+				CachedTokens: int(u.CachedContentTokenCount),
+			})
+		}
 		for _, cand := range resp.Candidates {
 			if cand.Content == nil {
 				continue

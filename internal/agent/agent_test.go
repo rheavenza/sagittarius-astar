@@ -21,6 +21,7 @@ type reply struct {
 	reasoning string
 	err       error
 	block     bool // wait for ctx cancellation
+	usage     llm.Usage
 }
 
 type fakeProvider struct {
@@ -54,6 +55,7 @@ func (f *fakeProvider) StreamChat(ctx context.Context, msgs []llm.Message, defs 
 	for _, tok := range r.tokens {
 		ch <- tok
 	}
+	llm.ReportUsage(ctx, r.usage)
 	return r.calls, r.reasoning, r.err
 }
 
@@ -453,8 +455,12 @@ func TestPlanModeBlocksChangesAndOffersOnlyReadTools(t *testing.T) {
 			t.Errorf("plan mode offered %s", name)
 		}
 	}
-	if !strings.Contains(p.requests[0][0].Content, "Plan mode (active)") {
-		t.Error("plan directive not sent")
+	req := p.requests[0]
+	if last := req[len(req)-1]; last.Role != llm.RoleSystem || !strings.Contains(last.Content, "Plan mode (active)") {
+		t.Error("plan directive not sent as the trailing note")
+	}
+	if strings.Contains(req[0].Content, "Plan mode") {
+		t.Error("plan directive must not change the system prompt (prompt cache)")
 	}
 	if len(cp.labels) != 0 {
 		t.Error("plan mode must not checkpoint")

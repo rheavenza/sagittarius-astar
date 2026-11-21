@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/agent"
+	"github.com/clitorhea/sagittarius-astar.git/internal/config"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 	"github.com/clitorhea/sagittarius-astar.git/internal/sandbox"
@@ -72,6 +73,8 @@ func (m *Model) startTurn() tea.Cmd {
 			m.agent.SetProvider(p)
 		}
 	}
+
+	m.agent.SetContextWindow(llm.ContextWindow(m.activeModel, config.LoadFileConfig().ContextWindows))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelTurn = cancel
@@ -201,6 +204,19 @@ func (m Model) handleAgentEvent(msg agentEventMsg) (Model, tea.Cmd) {
 			m.cmdTextarea.Focus()
 		}
 		m.refreshViewport()
+		return m, next
+
+	case agent.UsageEvent:
+		m.ctxUsed = ev.Usage.InputTokens + ev.Usage.OutputTokens
+		m.ctxWindow = ev.Window
+		m.ctxReported = ev.Reported
+		return m, next
+
+	case agent.HistoryEvent:
+		// Compaction: adopt the agent's history (it includes this turn's
+		// messages so far) and save it, so a crash can't resurrect the old one.
+		m.history = append([]llm.Message(nil), ev.History...)
+		m.saveSession()
 		return m, next
 
 	case agent.NoticeEvent:

@@ -239,6 +239,17 @@ func (m Model) statusBar() string {
 	if m.tokenEstimate >= 1000 {
 		tokens = fmt.Sprintf("~%dk tokens", m.tokenEstimate/1000)
 	}
+	if m.ctxWindow > 0 && m.ctxUsed > 0 {
+		pct := m.ctxUsed * 100 / m.ctxWindow
+		approx := ""
+		if !m.ctxReported {
+			approx = "~"
+		}
+		tokens = fmt.Sprintf("ctx %s%d%% (%s/%s)", approx, pct, kTok(m.ctxUsed), kTok(m.ctxWindow))
+		if pct >= 70 {
+			tokens = lipgloss.NewStyle().Foreground(colorYellow).Render(tokens)
+		}
+	}
 
 	// Right side, most important first; items are dropped from the end.
 	right := []string{
@@ -319,4 +330,16 @@ func modeDescription(planMode bool, mode agent.Mode) string {
 // updateTokenEstimate refreshes the cached history size shown in the status bar.
 func (m *Model) updateTokenEstimate() {
 	m.tokenEstimate = llm.EstimateHistoryTokens(m.history)
+}
+
+// kTok formats a token count compactly: 950, 45k, 1.0M.
+func kTok(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1e6)
+	case n >= 1000:
+		return fmt.Sprintf("%dk", (n+500)/1000)
+	default:
+		return fmt.Sprint(n)
+	}
 }

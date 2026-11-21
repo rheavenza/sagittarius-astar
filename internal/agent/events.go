@@ -74,6 +74,21 @@ type NoticeEvent struct {
 	Text  string
 }
 
+// HistoryEvent replaces the conversation history: the agent compacted it.
+// Front-ends must adopt History as their history (it already contains every
+// MessageEvent of the turn so far).
+type HistoryEvent struct {
+	History []llm.Message
+	Reason  string
+}
+
+// UsageEvent reports a request's token usage against the context window.
+type UsageEvent struct {
+	Usage    llm.Usage
+	Reported bool // false: InputTokens is aig's estimate, not the API's count
+	Window   int
+}
+
 // DoneEvent is always the last event of a turn.
 type DoneEvent struct {
 	Err     error // provider/stream failure
@@ -81,6 +96,8 @@ type DoneEvent struct {
 }
 
 func (StreamStartEvent) agentEvent() {}
+func (HistoryEvent) agentEvent()     {}
+func (UsageEvent) agentEvent()       {}
 func (TokenEvent) agentEvent()       {}
 func (MessageEvent) agentEvent()     {}
 func (ToolStartEvent) agentEvent()   {}

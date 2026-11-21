@@ -94,8 +94,12 @@ func (t *turn) execute(ctx context.Context, call llm.ToolCall) outcome {
 			return deniedOutcome("Explore subagents cannot ask the user for approval (" + reason + "). Stay inside the workspace.")
 		}
 	}
-	if call.Name == "explore" {
+	switch call.Name {
+	case "explore":
 		return t.explore(ctx, call)
+	case "read_output":
+		t.emit(ToolStartEvent{Call: call, Auto: true})
+		return t.a.readOutput(call)
 	}
 
 	switch risk {
