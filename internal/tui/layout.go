@@ -90,7 +90,7 @@ func (m Model) inputView() string {
 		}
 		return m.idleBox(m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render(label+"  (Ctrl+C to cancel)"))
 	case stateConfirmingCmd, stateConfirmingWrite, stateConfirmingTool, stateInputSudoPassword,
-		stateExecutingTool, stateRuntimeInput:
+		stateExecutingTool, stateRuntimeInput, stateAnswering:
 		return m.viewTurnInput()
 	case stateSelecting:
 		return m.selectionView()
@@ -218,6 +218,8 @@ func (m Model) statusBar() string {
 		statusText = "💾 write pending"
 	case stateInputSudoPassword:
 		statusText = "🔒 sudo password"
+	case stateAnswering:
+		statusText = "❓ question for you"
 	default:
 		statusText = "● ready"
 	}
@@ -252,6 +254,14 @@ func (m Model) statusBar() string {
 		if pct >= 70 {
 			tokens = lipgloss.NewStyle().Foreground(colorYellow).Render(tokens)
 		}
+	}
+
+	if len(m.plan) > 0 {
+		done, total := agent.PlanProgress(m.plan)
+		statusText += sub.Render(fmt.Sprintf(" · 📋 %d/%d", done, total))
+	}
+	if n := m.agent.RunningProcesses(); n > 0 {
+		statusText += sub.Render(fmt.Sprintf(" · ⚙ %d bg", n))
 	}
 
 	// Right side, most important first; items are dropped from the end.

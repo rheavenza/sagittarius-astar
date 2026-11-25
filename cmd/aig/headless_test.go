@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // The tests re-run the test binary as aig (AIG_TEST_MAIN=1), so flags,
@@ -250,4 +252,55 @@ func TestHeadlessMentionAttachesFile(t *testing.T) {
 	if !strings.Contains(r.stderr, "@nope/missing.go: no such file") {
 		t.Fatalf("missing mention not reported (even with -q): %q", r.stderr)
 	}
+}
+
+func TestHeadlessPlanQuestionAndBackgroundCleanup(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell")
+	}
+	home, dir := t.TempDir(), t.TempDir()
+	pidFile := filepath.Join(dir, "pid")
+	f := &fakeModel{replies: []string{
+		toolReply("p1", "update_plan", map[string]any{"items": []any{
+			map[string]any{"step": "start the server", "status": "in_progress"},
+			map[string]any{"step": "report", "status": "pending"},
+		}}),
+		toolReply("q1", "ask_user", map[string]any{"question": "Which port?", "options": []any{"8080", "3000"}}),
+		toolReply("c1", "run_command", map[string]any{"command": "echo $$ > " + pidFile + "; exec sleep 60", "background": true}),
+		textReply("Started on 8080 (assumed)."),
+	}}
+	r := runAig(t, f, home, dir, "", "-p", "--permission-mode", "auto", "--output-format", "stream-json", "start it")
+	if r.code != 0 {
+		t.Fatalf("exit %d, stderr: %s", r.code, r.stderr)
+	}
+	var types []string
+	for _, l := range strings.Split(strings.TrimSpace(r.stdout), "\n") {
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(l), &ev); err != nil {
+			t.Fatalf("bad line %q: %v", l, err)
+		}
+		types = append(types, ev["type"].(string))
+	}
+	got := strings.Join(types, ",")
+	if !strings.Contains(got, "plan") || !strings.Contains(got, "question") {
+		t.Fatalf("event types = %s; want plan and question events", got)
+	}
+	// The model was told nobody can answer.
+	msgs := messages(f.requests[2])
+	if c := msgs[len(msgs)-1]["content"].(string); !strings.Contains(c, "Nobody can answer") {
+		t.Fatalf("ask_user result = %q", c)
+	}
+	// The background process didn't outlive aig.
+	b, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("background command did not start: %v", err)
+	}
+	pid := strings.TrimSpace(string(b))
+	for i := 0; i < 50; i++ {
+		if exec.Command("kill", "-0", pid).Run() != nil {
+			return // gone
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("background process %s still running after aig exited", pid)
 }
