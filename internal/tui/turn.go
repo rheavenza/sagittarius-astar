@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -147,6 +148,12 @@ func (m Model) handleAgentEvent(msg agentEventMsg) (Model, tea.Cmd) {
 		}
 		return m, next
 
+	case agent.PlanEvent:
+		m.plan = ev.Items
+		m.appendOutput(strings.Join(planLines(ev.Items, ev.Explanation), "\n"))
+		m.refreshViewport()
+		return m, next
+
 	case agent.ToolStartEvent:
 		e := ev
 		m.currentTool = &e
@@ -161,7 +168,9 @@ func (m Model) handleAgentEvent(msg agentEventMsg) (Model, tea.Cmd) {
 		} else if ev.Call.Name == "run_checks" {
 			m.execTimeout = tools.MaxChecksTimeout
 		}
-		m.appendOutput(toolStartLine(ev))
+		if !quietTool(ev.Call.Name) {
+			m.appendOutput(toolStartLine(ev))
+		}
 		m.refreshViewport()
 		return m, tea.Batch(next, m.spinner.Tick)
 
@@ -197,6 +206,10 @@ func (m Model) handleAgentEvent(msg agentEventMsg) (Model, tea.Cmd) {
 		case agent.ApproveWrite:
 			m.appState = stateConfirmingWrite
 			m.cmdTextarea.SetValue("y")
+			m.cmdTextarea.Focus()
+		case agent.ApproveQuestion:
+			m.appState = stateAnswering
+			m.cmdTextarea.SetValue("")
 			m.cmdTextarea.Focus()
 		default:
 			m.appState = stateConfirmingTool
@@ -349,6 +362,9 @@ func toolStartLine(ev agent.ToolStartEvent) string {
 
 func (m *Model) renderToolResult(ev agent.ToolResultEvent) {
 	name := ev.Call.Name
+	if quietTool(name) && ev.Err == nil && !ev.Denied {
+		return // update_plan shows the plan, ask_user the answer
+	}
 	switch {
 	case ev.Denied:
 		m.appendOutput(confirmStyle.Render(fmt.Sprintf("✗ %s skipped: %s", name, ev.Result)))
@@ -382,6 +398,16 @@ func (m *Model) renderApproval(req *agent.ApprovalRequest) {
 		m.appendOutput(hint.Render("Enter to execute · edit the command if needed · Esc to skip · Ctrl+C to cancel the turn"))
 	case agent.ApproveSudoPassword:
 		m.appendOutput(confirmStyle.Render("🔒 Sudo password required for: " + req.Command))
+	case agent.ApproveQuestion:
+		m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("❓ " + req.Question))
+		for i, o := range req.Options {
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorText).Render(fmt.Sprintf("  %d. %s", i+1, o)))
+		}
+		if len(req.Options) > 0 {
+			m.appendOutput(hint.Render("Type a number or your own answer · Enter to send · Esc to skip"))
+		} else {
+			m.appendOutput(hint.Render("Type your answer · Enter to send · Esc to skip"))
+		}
 	case agent.ApproveWrite:
 		pw := req.Write
 		m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
@@ -425,7 +451,7 @@ func (m *Model) restoreTurnOutput() bool {
 		m.stream.baseLen = -1
 		m.refreshViewportStreaming()
 		return true
-	case stateConfirmingCmd, stateConfirmingWrite, stateConfirmingTool, stateInputSudoPassword:
+	case stateConfirmingCmd, stateConfirmingWrite, stateConfirmingTool, stateInputSudoPassword, stateAnswering:
 		if m.approval != nil {
 			m.renderApproval(m.approval)
 		}
@@ -561,6 +587,25 @@ func (m Model) handleTurnKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.cmdTextarea, cmd = m.cmdTextarea.Update(msg)
 		return m, cmd
 
+	case stateAnswering:
+		switch msg.Type {
+		case tea.KeyEsc:
+			m.answer(func(r *agent.ApprovalRequest) { r.Deny() }, "✗ Question skipped.")
+			return m, nil
+		case tea.KeyEnter:
+			text := strings.TrimSpace(m.cmdTextarea.Value())
+			if text == "" || m.approval == nil {
+				return m, nil
+			}
+			text = pickOption(text, m.approval.Options)
+			m.appendOutput(userLabelStyle.Render("You") + " " + lipgloss.NewStyle().Foreground(colorText).Render(text))
+			m.answer(func(r *agent.ApprovalRequest) { r.Answer(text) }, "")
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.cmdTextarea, cmd = m.cmdTextarea.Update(msg)
+		return m, cmd
+
 	case stateInputSudoPassword:
 		switch msg.Type {
 		case tea.KeyEsc:
@@ -646,6 +691,12 @@ func (m Model) viewTurnInput() string {
 		return m.activeBox(lipgloss.JoinVertical(lipgloss.Left,
 			confirmStyle.Render("🔒 This command requires sudo. Enter password (Esc to cancel):"),
 			m.sudoTextInput.View()))
+	case stateAnswering:
+		prompt := "❓ Your answer (Enter to send, Esc to skip):"
+		if m.approval != nil && len(m.approval.Options) > 0 {
+			prompt = fmt.Sprintf("❓ Your answer — 1-%d or your own words (Enter to send, Esc to skip):", len(m.approval.Options))
+		}
+		return m.activeBox(lipgloss.JoinVertical(lipgloss.Left, confirmStyle.Render(prompt), m.cmdTextarea.View()))
 	case stateRuntimeInput:
 		return m.activeBox(lipgloss.JoinVertical(lipgloss.Left,
 			hint.Render("⌨️  Type a line to send to the running process (Enter to send · Esc to return)"),
@@ -682,4 +733,42 @@ func (m Model) viewTurnInput() string {
 func (m Model) agentRootForTest() string {
 	wd, _ := os.Getwd()
 	return wd
+}
+
+// quietTool reports tools whose start/done lines are noise: their effect is
+// shown another way (the plan checklist, the question and its answer).
+func quietTool(name string) bool { return name == "update_plan" || name == "ask_user" }
+
+// pickOption maps "2" to the second option; other answers are kept as typed.
+func pickOption(text string, options []string) string {
+	if n, err := strconv.Atoi(strings.TrimSuffix(text, ".")); err == nil && n >= 1 && n <= len(options) {
+		return options[n-1]
+	}
+	return text
+}
+
+// planArgs parses an update_plan call from the history for display.
+func planArgs(call llm.ToolCall) ([]agent.PlanItem, bool) {
+	items := agent.PlanFromHistory([]llm.Message{{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{call}}})
+	return items, len(items) > 0
+}
+
+// planLines renders the plan as a checklist.
+func planLines(items []agent.PlanItem, explanation string) []string {
+	done, total := agent.PlanProgress(items)
+	lines := []string{lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(fmt.Sprintf("📋 Plan (%d/%d)", done, total))}
+	if explanation != "" {
+		lines = append(lines, lipgloss.NewStyle().Foreground(colorSubtext).Italic(true).Render("  "+explanation))
+	}
+	for _, it := range items {
+		switch it.Status {
+		case agent.PlanDone:
+			lines = append(lines, lipgloss.NewStyle().Foreground(colorGreen).Render("  ✓ ")+lipgloss.NewStyle().Foreground(colorSubtext).Strikethrough(true).Render(it.Step))
+		case agent.PlanInProgress:
+			lines = append(lines, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("  ▸ "+it.Step))
+		default:
+			lines = append(lines, lipgloss.NewStyle().Foreground(colorText).Render("  ○ "+it.Step))
+		}
+	}
+	return lines
 }

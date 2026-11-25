@@ -100,7 +100,21 @@ func TestCompactionFailureFallsBackToPruning(t *testing.T) {
 	}
 }
 
-func TestSingleLongTurnElidesOldToolOutputs(t *testing.T) {
+// summaryErrProvider fails every tool-less (summary) request.
+type summaryErrProvider struct{ fakeProvider }
+
+func (s *summaryErrProvider) StreamChat(ctx context.Context, msgs []llm.Message, defs []llm.Tool, ch chan<- string) ([]llm.ToolCall, string, error) {
+	if len(defs) == 0 {
+		close(ch)
+		s.mu.Lock()
+		s.toolSets = append(s.toolSets, nil)
+		s.mu.Unlock()
+		return nil, "", fmt.Errorf("summary model unavailable")
+	}
+	return s.fakeProvider.StreamChat(ctx, msgs, defs, ch)
+}
+
+func TestSingleLongTurnElidesOldToolOutputsWhenSummaryFails(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "big.txt")
 	os.WriteFile(f, []byte(strings.Repeat("line of text\n", 500)), 0o644) // ~6.5 KB
@@ -109,7 +123,7 @@ func TestSingleLongTurnElidesOldToolOutputs(t *testing.T) {
 		replies = append(replies, reply{calls: []llm.ToolCall{{ID: fmt.Sprint(i), Name: "read_file", Args: map[string]any{"path": f, "start_line": float64(i + 1)}}}})
 	}
 	replies = append(replies, reply{tokens: []string{"done"}})
-	p := &fakeProvider{replies: replies}
+	p := &summaryErrProvider{fakeProvider{replies: replies}}
 	a := New(Options{Provider: p, WorkspaceRoot: dir, MaxContextTokens: 8000})
 	evs, _ := collect(t, a.Run(context.Background(), user("read it many times")), nil)
 	done(t, evs)
@@ -134,10 +148,26 @@ func TestSingleLongTurnElidesOldToolOutputs(t *testing.T) {
 			t.Errorf("request %d is ~%d tokens: over the window", i, est)
 		}
 	}
-	// No summary request was made: nothing before the turn to summarize.
+	// The failed turn summary was tried once, not every round.
+	summaries := 0
 	for _, ts := range p.toolSets {
 		if len(ts) == 0 {
-			t.Error("unexpected tool-less (summary) request")
+			summaries++
+		}
+	}
+	if summaries != 1 {
+		t.Errorf("summary requests = %d, want 1 (then elision for the rest of the turn)", summaries)
+	}
+	// The elided outputs can be read back instead of re-running the tool.
+	for _, m := range last {
+		if m.Role == llm.RoleTool && strings.HasPrefix(m.Content, elidedPrefix) {
+			id := m.Content[strings.Index(m.Content, "out-"):]
+			id = id[:strings.IndexAny(id, " ;")]
+			out := a.readOutput(llm.ToolCall{Name: "read_output", Args: map[string]any{"id": id, "start_line": float64(1), "end_line": float64(2)}})
+			if out.err != nil || !strings.Contains(out.result, "line of text") {
+				t.Fatalf("read_output(%s) = %+v", id, out)
+			}
+			break
 		}
 	}
 }

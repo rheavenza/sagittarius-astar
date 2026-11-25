@@ -44,16 +44,7 @@ func (m *Model) summaryModel() (llm.Provider, string, error) {
 	if spec == "" {
 		return m.agent.Provider(), m.activeProvider + ":" + m.activeModel, nil
 	}
-	prov, model := m.activeProvider, spec
-	if p, rest, ok := strings.Cut(spec, ":"); ok {
-		for _, known := range config.Providers() {
-			if config.NormalizeProvider(p) == known {
-				prov, model = string(known), rest
-			}
-		}
-	}
-	name := config.NormalizeProvider(prov)
-	ep, err := config.ResolveEndpoint(name)
+	name, model, ep, err := config.ResolveModelSpec(spec, config.ProviderName(m.activeProvider))
 	if err != nil {
 		return nil, "", err
 	}

@@ -214,7 +214,11 @@ Prefer specific, targeted commands. Avoid commands that start interactive sessio
 					},
 					"timeout_seconds": map[string]any{
 						"type":        "integer",
-						"description": "Max seconds to wait (1-120, default 30)",
+						"description": "Max seconds to wait (1-120, default 30). Ignored with background.",
+					},
+					"background": map[string]any{
+						"type":        "boolean",
+						"description": "Run in the background and return at once with a process id (dev servers, watchers, builds longer than 2 minutes). Read its output with read_process_output, stop it with kill_process.",
 					},
 				},
 				"required": []string{"command"},

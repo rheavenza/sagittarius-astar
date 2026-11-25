@@ -50,6 +50,7 @@ const (
 	stateInputSudoPassword              // Awaiting a sudo password (no graphical askpass).
 	stateRuntimeInput                   // Sending a stdin line to a running command.
 	stateConfirmingTool                 // Awaiting approval of an MCP / web_fetch / out-of-workspace tool call.
+	stateAnswering                      // Answering an ask_user question from the agent.
 )
 
 type selectionItem struct {
@@ -71,6 +72,7 @@ type Model struct {
 	cancelling  bool
 	approval    *agent.ApprovalRequest // pending approval, if any
 	currentTool *agent.ToolStartEvent  // tool currently executing
+	plan        []agent.PlanItem       // the agent's task plan (update_plan)
 	stdin       io.Writer              // stdin of the running command (Ctrl+I)
 
 	// Streaming display
@@ -488,6 +490,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 							}}
 						}
 						m.history = m.activeSession.History
+						m.plan = nil
 						m.titleGenerated = false
 						m.outputLines = nil
 						m.syncCheckpointSession()
@@ -828,7 +831,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			}
 
 		case stateStreaming, stateExecutingTool, stateRuntimeInput, stateConfirmingCmd,
-			stateConfirmingWrite, stateConfirmingTool, stateInputSudoPassword:
+			stateConfirmingWrite, stateConfirmingTool, stateInputSudoPassword, stateAnswering:
 			return m.handleTurnKey(msg)
 
 		case stateSelecting:
@@ -1141,11 +1144,20 @@ func cleanTitle(raw, query string) string {
 func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 	m.outputLines = nil
 	m.history = history
+	m.plan = agent.PlanFromHistory(history)
 
 	for i, msg := range m.history {
 		if msg.Role == llm.RoleSystem {
 			if i == 0 {
 				// Initial system prompt is not rendered in output
+				continue
+			}
+			if strings.HasPrefix(msg.Content, agent.TurnCompactedPrefix) {
+				m.outputLines = append(m.outputLines,
+					systemLabelStyle.Render("📦 Earlier progress on this request (compacted)"),
+					lipgloss.NewStyle().Foreground(colorSubtext).Render(strings.TrimSpace(strings.TrimPrefix(msg.Content, agent.TurnCompactedPrefix))),
+					m.convDivider(),
+				)
 				continue
 			}
 			// Command execution feedback from sandboxing
@@ -1206,7 +1218,14 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 				}
 				if hasResult {
 					// Render the tool call start line.
-					if call.Name == "run_command" {
+					if call.Name == "update_plan" {
+						if items, ok := planArgs(call); ok {
+							m.outputLines = append(m.outputLines, planLines(items, "")...)
+						}
+					} else if call.Name == "ask_user" {
+						q, _ := call.Args["question"].(string)
+						m.outputLines = append(m.outputLines, confirmStyle.Render("❓ "+q))
+					} else if call.Name == "run_command" {
 						command, _ := call.Args["command"].(string)
 						m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Render(
 							fmt.Sprintf("⚙ Tool: run_command: %s", command)))
@@ -1227,7 +1246,9 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 				if msg.ToolName == "run_command" || msg.ToolName == "run_checks" || msg.ToolName == "explore" {
 					m.outputLines = append(m.outputLines, errorStyle.Render(msg.Content))
 				}
-			} else {
+			} else if msg.ToolName == "ask_user" {
+				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorSubtext).Render("  ↳ "+strings.TrimPrefix(msg.Content, "The user answered: ")))
+			} else if msg.ToolName != "update_plan" {
 				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s done", msg.ToolName)))
 				if msg.ToolName == "run_command" || msg.ToolName == "run_checks" || msg.ToolName == "explore" {
 					m.outputLines = append(m.outputLines, execResultStyle.Render(msg.Content))

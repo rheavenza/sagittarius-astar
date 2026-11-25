@@ -625,3 +625,51 @@ func TestTUIMentionCompletionAndAttach(t *testing.T) {
 		t.Fatalf("reloaded transcript:\n%s", out)
 	}
 }
+
+func TestTUIAskUserPickOptionAndShowPlan(t *testing.T) {
+	d := newDriver(t, &fakeProvider{replies: []scripted{
+		{calls: []llm.ToolCall{{ID: "p1", Name: "update_plan", Args: map[string]any{"items": []any{
+			map[string]any{"step": "pick a database", "status": "in_progress"},
+			map[string]any{"step": "write the schema", "status": "pending"},
+		}}}}},
+		{calls: []llm.ToolCall{{ID: "q1", Name: "ask_user", Args: map[string]any{"question": "Which database?", "options": []any{"Postgres", "SQLite"}}}}},
+		{tokens: []string{"Going with SQLite."}},
+	}})
+	d.submit("set up storage")
+	d.runUntil("question", func(m Model) bool { return m.appState == stateAnswering })
+
+	out := output(d.m)
+	for _, want := range []string{"📋 Plan (0/2)", "▸ pick a database", "○ write the schema", "❓ Which database?", "2. SQLite"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Tool: update_plan") || strings.Contains(out, "Tool update_plan done") {
+		t.Errorf("update_plan should show the plan, not tool lines:\n%s", out)
+	}
+	if !strings.Contains(reANSI.ReplaceAllString(d.m.statusBar(), ""), "📋 0/2") {
+		t.Errorf("status bar lacks the plan progress: %q", d.m.statusBar())
+	}
+
+	d.m.cmdTextarea.SetValue("2")
+	d.key(tea.KeyEnter)
+	d.runUntil("turn done", idle)
+	h := d.m.history
+	assertAnswered(t, h)
+	var answer string
+	for _, m := range h {
+		if m.Role == llm.RoleTool && m.ToolName == "ask_user" {
+			answer = m.Content
+		}
+	}
+	if answer != "The user answered: SQLite" {
+		t.Fatalf("ask_user result = %q", answer)
+	}
+
+	// Reloading the session shows the plan again and restores the counter.
+	d.m.plan = nil
+	d.m.loadHistory(h, false)
+	if len(d.m.plan) != 2 || !strings.Contains(output(d.m), "📋 Plan (0/2)") {
+		t.Errorf("reloaded plan = %+v\n%s", d.m.plan, output(d.m))
+	}
+}

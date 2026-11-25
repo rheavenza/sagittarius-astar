@@ -152,9 +152,16 @@ func runHeadless(_ *cobra.Command, args []string) error {
 		case agent.HistoryEvent:
 			history = append([]llm.Message(nil), e.History...)
 		case agent.ApprovalEvent:
+			if e.Req.Kind == agent.ApproveQuestion {
+				e.Req.DenyWithReason(headlessQuestionReply)
+				out.question(e.Req)
+				break
+			}
 			res.Denied = append(res.Denied, e.Req.Title)
 			e.Req.DenyWithReason(headlessDenial(rt.agent, e.Req))
 			out.denied(e.Req)
+		case agent.PlanEvent:
+			out.plan(e)
 		case agent.ToolStartEvent:
 			// Nobody can type into a running command: give it EOF.
 			if c, ok := e.Stdin.(io.Closer); ok {
@@ -207,6 +214,10 @@ func runHeadless(_ *cobra.Command, args []string) error {
 	}
 	return nil
 }
+
+// headlessQuestionReply answers ask_user when nobody is there.
+const headlessQuestionReply = "Nobody can answer: aig is running headless (aig -p). Do not ask again. " +
+	"Make the most reasonable choice, state the assumption in your answer, and continue."
 
 // headlessDenial is what the model is told when a call needs approval.
 func headlessDenial(a *agent.Agent, req *agent.ApprovalRequest) string {
@@ -296,6 +307,28 @@ func (o *headlessOutput) denied(req *agent.ApprovalRequest) {
 	if !flagQuiet {
 		fmt.Fprintln(os.Stderr, "aig: denied (needs approval): "+tools.TruncateUTF8(what, 200))
 	}
+}
+
+func (o *headlessOutput) question(req *agent.ApprovalRequest) {
+	o.event(map[string]any{"type": "question", "question": req.Question, "options": req.Options, "answered": false})
+	if o.progress {
+		fmt.Fprintln(os.Stderr, o.dim("? "+tools.TruncateUTF8(oneLine(req.Question), 200)+" (no one to ask: the agent will assume)"))
+	}
+}
+
+func (o *headlessOutput) plan(e agent.PlanEvent) {
+	o.event(map[string]any{"type": "plan", "items": e.Items, "explanation": e.Explanation})
+	if !o.progress {
+		return
+	}
+	done, total := agent.PlanProgress(e.Items)
+	for _, it := range e.Items {
+		if it.Status == agent.PlanInProgress {
+			fmt.Fprintln(os.Stderr, o.dim(fmt.Sprintf("plan %d/%d › %s", done, total, it.Step)))
+			return
+		}
+	}
+	fmt.Fprintln(os.Stderr, o.dim(fmt.Sprintf("plan %d/%d", done, total)))
 }
 
 func (o *headlessOutput) notice(e agent.NoticeEvent) {

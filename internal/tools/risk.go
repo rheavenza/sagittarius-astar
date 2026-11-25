@@ -48,14 +48,20 @@ var nativeRisk = map[string]Risk{
 	"project_overview": RiskRead,
 	"explore":          RiskRead, // a subagent limited to RiskRead tools
 	"read_output":      RiskRead, // run by the agent (its output store)
-	"web_search":       RiskNetwork,
-	"web_fetch":        RiskNetwork,
-	"web_scrape":       RiskNetwork,
-	"write_file":       RiskWrite,
-	"edit_file":        RiskWrite,
-	"multi_edit":       RiskWrite,
-	"run_command":      RiskExec,
-	"run_checks":       RiskExec,
+	// Run by the agent (internal/agent), not tools.Execute. They are not in
+	// Definitions, so explore subagents never get them.
+	"update_plan":         RiskRead, // the agent's task checklist
+	"ask_user":            RiskRead, // a question to the user
+	"read_process_output": RiskRead, // output of the agent's background processes
+	"kill_process":        RiskExec, // stops a background process (blocked in plan mode)
+	"web_search":          RiskNetwork,
+	"web_fetch":           RiskNetwork,
+	"web_scrape":          RiskNetwork,
+	"write_file":          RiskWrite,
+	"edit_file":           RiskWrite,
+	"multi_edit":          RiskWrite,
+	"run_command":         RiskExec,
+	"run_checks":          RiskExec,
 }
 
 // RiskOf returns the risk of a native tool, and whether the name is a native tool.

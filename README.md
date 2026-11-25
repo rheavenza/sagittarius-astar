@@ -160,6 +160,11 @@ On startup aig builds a context block that is appended to the system prompt of e
 | `explore` | Hands a codebase question to a subagent that starts with a fresh context and has only local read-only tools. Only its answer comes back, so the raw tool output never enters the main context |
 | `project_overview` | Reads the `/summarize` index: the project overview and folder list, one folder, or one file. Files that changed since are flagged. Offered once an index exists |
 | `run_checks` | Runs the project checks from `.aig/config.json` (only offered when some are configured) |
+| `update_plan` | The agent's checklist for a multi-step task. It shows in the conversation as `📋 Plan (2/5)` with ✓ / ▸ / ○ steps, and the status bar shows the progress. It survives compaction and session resume |
+| `ask_user` | The agent asks you a question mid-task (with suggested answers: type a number or your own words) and continues with the answer. Esc skips; headless runs tell the model nobody can answer |
+| `run_command` + `background: true` | Starts a dev server, watcher or long build in the background and returns at once with an id (`proc-1`). `read_process_output` reads new output (`wait_seconds`, `pattern` to wait for a line like "listening"), `kill_process` stops it with its children. The status bar shows `⚙ N bg`; aig stops them all when it exits |
+
+Read-only calls the model makes together in one response (`read_file`, `search_regex`, `find_files`, `repo_map`, `explore`, `web_search`, …) run in parallel, up to 8 at a time. Anything that writes, runs a command, asks for approval or talks to you runs on its own, in order.
 
 After each confirmed write aig runs a quick check and returns the result to the model: `go vet` on the package (or `gofmt -e`), `python3 -m py_compile`, `bash -n`, `node --check`, JSON validation. Override or extend per extension:
 ```json
@@ -169,9 +174,12 @@ After each confirmed write aig runs a quick check and returns the result to the 
 ### Context management
 - **Status bar:** shows how much of the model's context window the last request used, e.g. `ctx 34% (45k/131k)`. The numbers come from the API when the provider reports them; `~` marks an estimate.
 - **Windows:** context windows come from a built-in table. Override them with `"context_windows": {"moonshotai/kimi-k3": 262144}`.
-- **Automatic compaction:** at about 80% of the window, aig summarizes the older turns with the current model and keeps the recent ones word for word. A 📦 notice shows the before/after size.
-  - If a single long turn fills the context, its older large tool outputs are shortened instead.
+- **Automatic compaction:** at about 80% of the window (at most 200k tokens), aig summarizes the older turns and keeps the recent ones word for word. A 📦 notice shows the before/after size.
+  - If a single long request fills the context, the earlier tool rounds of that request are summarized. Your request and the latest rounds stay word for word.
+  - Every summary ends with an exact record that aig takes from the tool calls, not from the model: the files changed, the last 15 commands with their exit codes, and the current plan.
+  - If a summary request fails, old tool outputs are shortened instead. The full outputs stay available through `read_output`, so nothing has to be re-run.
   - `/compact` does it on demand.
+  - `"compact_model": "deepseek:deepseek-v4-flash"` writes the summaries with a cheaper model (same format as `summary_model`; default: the session's model). `"compact_at_tokens": 400000` moves the cap (`-1`: only 80% of the window).
 - **Large tool outputs** (over 16 KB) stay out of the conversation. The model sees the first and last 3 KB plus an ID, and fetches the rest with `read_output` (a line range or a regex).
 
 ### Project summary (`/summarize`)

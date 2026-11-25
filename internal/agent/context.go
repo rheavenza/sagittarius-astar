@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
@@ -27,7 +28,20 @@ const (
 	// maxSummaryInputShare of the window may be used by the transcript sent
 	// to the summarizer.
 	maxSummaryInputShare = 0.6
+	// DefaultCompactAtTokens caps the compaction point on large windows:
+	// requests near a 1M-token window are slow and costly, and models get
+	// worse with very long contexts well before the window is full.
+	DefaultCompactAtTokens = 200_000
+	// minTurnCompactBytes: a part of the current turn smaller than this is
+	// not worth a summary request.
+	minTurnCompactBytes = 8 * 1024
+	// maxRecordCommands is how many commands the exact record keeps.
+	maxRecordCommands = 15
 )
+
+// TurnCompactedPrefix starts the system note that replaces the earlier tool
+// rounds of the current request (compaction within one long turn).
+const TurnCompactedPrefix = "[Progress on this request compacted]"
 
 // CompactedPrefix starts the user message that carries a compaction summary.
 const CompactedPrefix = "[Earlier conversation compacted]"
@@ -50,12 +64,69 @@ Keep exact paths, function names, commands, flags and error messages. Drop pleas
 %s
 </transcript>`
 
+const compactTurnInstr = `The agent below is in the middle of one long request from the user. Summarize its progress so far for the agent that continues it: it will see the user's request, your summary and its most recent tool rounds, but not the transcript below.
+
+Include, as markdown bullets under short headings:
+1. Findings: what the agent learned about the code and the problem (exact paths, function names, line numbers, behaviour).
+2. Changes made so far (exact paths and what changed) and commands run with their outcomes.
+3. What failed or was ruled out, and why (exact error messages).
+4. Where it is now and what it was about to do next.
+Keep exact identifiers. Drop raw file contents and long outputs; keep only the facts the agent will need. If the transcript contains an earlier progress summary, merge it in. At most ~600 words.
+
+<request>
+%s
+</request>
+
+<transcript>
+%s
+</transcript>`
+
 // budget tracks the context window and the estimate calibration.
 type budget struct {
 	mu       sync.Mutex
 	window   int     // model context window in tokens; 0 = unknown
 	factor   float64 // real tokens / estimated tokens, smoothed
 	override int     // Options.MaxContextTokens (tests, explicit config)
+	// compactCap caps the compaction point in tokens: 0 = DefaultCompactAtTokens,
+	// negative = no cap (compact at compactAt of the window).
+	compactCap int
+}
+
+// SetCompactAt sets the token count at which history is compacted on large
+// windows (0 = DefaultCompactAtTokens, negative = only the window share).
+func (a *Agent) SetCompactAt(tokens int) {
+	a.budget.mu.Lock()
+	defer a.budget.mu.Unlock()
+	a.budget.compactCap = tokens
+}
+
+func (b *budget) capTokens() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch {
+	case b.compactCap < 0:
+		return 0
+	case b.compactCap == 0:
+		return DefaultCompactAtTokens
+	}
+	return b.compactCap
+}
+
+// SetCompactProvider sets the model that writes compaction summaries (nil =
+// the session's model). A cheaper, fast model works well here.
+func (a *Agent) SetCompactProvider(p llm.Provider) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.compactProvider = p
+}
+
+func (a *Agent) summarizer(fallback llm.Provider) llm.Provider {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.compactProvider != nil {
+		return a.compactProvider
+	}
+	return fallback
 }
 
 func (b *budget) get() (window int, factor float64) {
@@ -105,13 +176,19 @@ func (a *Agent) ContextWindow() int {
 	return w
 }
 
-// limits returns, in calibrated tokens: the hard limit for a request and
-// the point at which to compact.
-func limits(window int) (hard, compact, keep int) {
+// limits returns, in calibrated tokens: the hard limit for a request, the
+// point at which to compact, and how much to keep verbatim. capTokens > 0
+// lowers the compaction point on large windows; the verbatim share scales
+// with it, so compaction still frees most of the context.
+func limits(window, capTokens int) (hard, compact, keep int) {
 	reserve := min(window/8, maxOutputReserve)
 	hard = window - reserve
-	compact = min(int(float64(window)*compactAt), hard)
-	keep = int(float64(window) * keepShare)
+	eff := float64(window)
+	if capTokens > 0 && float64(capTokens) < eff*compactAt {
+		eff = float64(capTokens) / compactAt
+	}
+	compact = min(int(eff*compactAt), hard)
+	keep = int(eff * keepShare)
 	return hard, compact, keep
 }
 
@@ -137,7 +214,7 @@ func defsTokens(defs []llm.Tool) int {
 // is sent (PruneHistory). It returns the messages to send.
 func (t *turn) fitContext(ctx context.Context, defs []llm.Tool) []llm.Message {
 	window, factor := t.a.budget.get()
-	hard, compactLimit, keep := limits(window)
+	hard, compactLimit, keep := limits(window, t.a.budget.capTokens())
 	withCtx := WithContextBlock(t.history, t.contextBlock)
 
 	if est := t.estimate(withCtx, defs); est > compactLimit && !t.compactFailed {
@@ -183,7 +260,11 @@ func kTokens(n int) string {
 // long turn there is nothing to summarize, so old tool outputs of that turn
 // are elided instead. The front-end is told with a HistoryEvent.
 func (t *turn) compact(ctx context.Context, keep int) error {
-	newHist, err := t.a.compactHistory(ctx, t.provider, t.history, keep)
+	newHist, turnErr, err := t.a.compactHistory(ctx, t.provider, t.history, keep, t.turnSummaryFailed)
+	if turnErr != nil && !t.turnSummaryFailed {
+		t.turnSummaryFailed = true
+		t.emit(NoticeEvent{Level: NoticeWarn, Text: "Summarizing this turn's earlier tool rounds failed (" + shortError(turnErr) + "); shortening old tool outputs instead."})
+	}
 	if err != nil {
 		return err
 	}
@@ -195,14 +276,36 @@ func (t *turn) compact(ctx context.Context, keep int) error {
 // Compact summarizes all but the last user turn of history (the /compact
 // command). It returns the new history.
 func (a *Agent) Compact(ctx context.Context, history []llm.Message) ([]llm.Message, error) {
-	return a.compactHistory(ctx, a.Provider(), history, 0)
+	out, _, err := a.compactHistory(ctx, a.Provider(), history, 0, false)
+	return out, err
+}
+
+// summarize sends one summary request with the compaction model, retrying
+// transient errors like the main loop does.
+func (a *Agent) summarize(ctx context.Context, fallback llm.Provider, prompt string) (string, error) {
+	p := a.summarizer(fallback)
+	for attempt := 0; ; attempt++ {
+		out, err := completeText(ctx, p, compactSystem, prompt)
+		if err == nil || ctx.Err() != nil || attempt >= maxStreamRetries || !llm.IsRetryable(err) {
+			return out, err
+		}
+		logger.L.Warn("agent: summary request failed, retrying", "attempt", attempt+1, "error", err)
+		select {
+		case <-time.After(retryDelay(attempt)):
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 }
 
 // compactHistory does the work for compact and Compact. keep (calibrated
-// tokens) bounds the verbatim tail; 0 keeps only the last user turn.
-func (a *Agent) compactHistory(ctx context.Context, provider llm.Provider, history []llm.Message, keep int) ([]llm.Message, error) {
+// tokens) bounds the verbatim tail; 0 keeps only the last user turn. When
+// one turn fills the context it summarizes that turn's earlier rounds
+// (unless skipTurnSummary) and falls back to shortening tool outputs;
+// turnErr reports a failed turn summary.
+func (a *Agent) compactHistory(ctx context.Context, provider llm.Provider, history []llm.Message, keep int, skipTurnSummary bool) (out []llm.Message, turnErr, err error) {
 	if provider == nil {
-		return nil, fmt.Errorf("no model provider configured")
+		return nil, nil, fmt.Errorf("no model provider configured")
 	}
 	window, factor := a.budget.get()
 	head := 0
@@ -220,7 +323,7 @@ func (a *Agent) compactHistory(ctx context.Context, provider llm.Provider, histo
 		}
 	}
 	if lastUser < 0 {
-		return nil, fmt.Errorf("nothing to compact")
+		return nil, nil, fmt.Errorf("nothing to compact")
 	}
 	cut := lastUser
 	if keep > 0 {
@@ -239,39 +342,247 @@ func (a *Agent) compactHistory(ctx context.Context, provider llm.Provider, histo
 	// summarizing it again gains nothing. Same if nothing precedes the cut.
 	if cut <= head || (cut-head <= 2 && strings.HasPrefix(history[head].Content, CompactedPrefix)) {
 		if keep == 0 { // manual /compact
-			return nil, fmt.Errorf("%w: the conversation is already compacted up to the last exchange", errNothingToCompact)
+			return nil, nil, fmt.Errorf("%w: the conversation is already compacted up to the last exchange", errNothingToCompact)
 		}
-		out, n := elideToolOutputs(history, cut, int(float64(window)/2/factor))
+		// One long turn fills the context: summarize its earlier tool rounds,
+		// or, if that isn't possible, shorten its old tool outputs.
+		if !skipTurnSummary {
+			out, err := a.compactTurn(ctx, provider, history, lastUser, keep)
+			if err == nil {
+				return out, nil, nil
+			}
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			if !errors.Is(err, errNothingToCompact) {
+				logger.L.Warn("agent: in-turn compaction failed; eliding tool outputs", "error", err)
+				turnErr = err
+			}
+		}
+		out, n := a.elideToolOutputs(history, cut, int(float64(window)/2/factor))
 		if n == 0 {
-			return nil, fmt.Errorf("%w: the current turn alone fills the context", errNothingToCompact)
+			return nil, turnErr, fmt.Errorf("%w: the current turn alone fills the context", errNothingToCompact)
 		}
-		return out, nil
+		return out, turnErr, nil
 	}
 
 	transcript := renderTranscript(history[head:cut], int(float64(window)*maxSummaryInputShare/factor)*4)
-	summary, err := completeText(ctx, provider, compactSystem, fmt.Sprintf(compactInstr, transcript))
+	summary, err := a.summarize(ctx, provider, fmt.Sprintf(compactInstr, transcript))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	summary += a.summaryAppendix(history[head:cut])
 
-	out := make([]llm.Message, 0, head+2+len(history)-cut)
+	out = make([]llm.Message, 0, head+2+len(history)-cut)
 	out = append(out, history[:head]...)
 	out = append(out,
 		llm.Message{Role: llm.RoleUser, Content: CompactedPrefix + "\nThe earlier part of this conversation was summarized to save context:\n\n" + summary},
 		llm.Message{Role: llm.RoleAssistant, Content: compactAck},
 	)
 	out = append(out, history[cut:]...)
-	return out, nil
+	return out, nil, nil
 }
 
 // errNothingToCompact: compaction found nothing it could shrink.
 var errNothingToCompact = errors.New("nothing to compact")
 
+// compactTurn summarizes the earlier tool rounds of the current request
+// (history[lastUser+1:cut]) into one system note, keeping the user's request
+// and the most recent rounds that fit in keep tokens verbatim. Cuts are made
+// before an assistant message, so tool calls and their results stay together.
+func (a *Agent) compactTurn(ctx context.Context, provider llm.Provider, history []llm.Message, lastUser, keep int) ([]llm.Message, error) {
+	window, factor := a.budget.get()
+	from := lastUser + 1
+	cut, lastAssistant := -1, -1
+	for i := from + 1; i < len(history); i++ {
+		if history[i].Role != llm.RoleAssistant {
+			continue
+		}
+		lastAssistant = i
+		if cut < 0 && int(float64(llm.EstimateHistoryTokens(history[i:]))*factor) <= keep {
+			cut = i
+		}
+	}
+	if cut < 0 {
+		cut = lastAssistant // keep at least the latest round
+	}
+	if cut <= from {
+		return nil, fmt.Errorf("%w: no earlier tool rounds in this turn", errNothingToCompact)
+	}
+	segment := history[from:cut]
+	size := 0
+	for _, m := range segment {
+		size += len(m.Content)
+		for _, c := range m.ToolCalls {
+			b, _ := json.Marshal(c.Args)
+			size += len(b)
+		}
+	}
+	if size < minTurnCompactBytes {
+		return nil, fmt.Errorf("%w: the earlier rounds of this turn are small", errNothingToCompact)
+	}
+
+	request := tools.TruncateUTF8(strings.TrimSpace(history[lastUser].Content), 6000)
+	transcript := renderTranscript(segment, int(float64(window)*maxSummaryInputShare/factor)*4)
+	summary, err := a.summarize(ctx, provider, fmt.Sprintf(compactTurnInstr, request, transcript))
+	if err != nil {
+		return nil, err
+	}
+	summary += a.summaryAppendix(segment)
+
+	out := make([]llm.Message, 0, from+1+len(history)-cut)
+	out = append(out, history[:from]...)
+	out = append(out, llm.Message{Role: llm.RoleSystem, Content: TurnCompactedPrefix +
+		"\nThe earlier tool rounds of this request were summarized to save context. Re-read files before editing them.\n\n" + summary})
+	out = append(out, history[cut:]...)
+	return out, nil
+}
+
+// summaryAppendix is what aig adds to a summary itself, exactly: the record
+// of file changes and commands taken from the summarized tool calls (merged
+// with the record of an earlier summary), and the current plan.
+func (a *Agent) summaryAppendix(summarized []llm.Message) string {
+	var b strings.Builder
+	if rec := workRecord(summarized); rec != "" {
+		b.WriteString("\n\n" + rec)
+	}
+	if pb := planBlock(a.plan.get()); pb != "" {
+		b.WriteString("\n\n" + pb)
+	}
+	return b.String()
+}
+
+const (
+	recordHeading = "## Exact record (from tool calls)"
+	recordEdited  = "- edited: "
+	recordRan     = "- ran: "
+)
+
+// workRecord lists the files changed and the commands run in msgs, from the
+// tool calls and their results, so the summary doesn't depend on the model
+// copying them. Lines of an earlier record inside msgs are carried over.
+func workRecord(msgs []llm.Message) string {
+	results := map[string]string{}
+	for _, m := range msgs {
+		if m.Role == llm.RoleTool {
+			results[m.ToolCallID] = m.Content
+		}
+	}
+	var edited []string
+	seen := map[string]bool{}
+	addEdited := func(p string) {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			edited = append(edited, p)
+		}
+	}
+	var ran []string
+	for _, m := range msgs {
+		// Carry over an earlier record (in a previous summary).
+		prevEdited, prevRan := earlierRecord(m.Content)
+		for _, p := range prevEdited {
+			addEdited(p)
+		}
+		ran = append(ran, prevRan...)
+		for _, c := range m.ToolCalls {
+			res, answered := results[c.ID]
+			switch c.Name {
+			case "write_file", "edit_file", "multi_edit":
+				if p, _ := c.Args["path"].(string); answered && strings.HasPrefix(res, "Successfully wrote") {
+					addEdited(p)
+				}
+			case "run_command":
+				cmd, _ := c.Args["command"].(string)
+				if !answered || cmd == "" {
+					continue
+				}
+				ran = append(ran, recordRan+"`"+oneLineClip(cmd, 160)+"` → "+commandOutcome(res))
+			}
+		}
+	}
+	if len(ran) > maxRecordCommands {
+		ran = append([]string{fmt.Sprintf("- (%d earlier commands omitted)", len(ran)-maxRecordCommands)}, ran[len(ran)-maxRecordCommands:]...)
+	}
+	if len(edited) == 0 && len(ran) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(recordHeading + "\n")
+	for _, p := range edited {
+		b.WriteString(recordEdited + p + "\n")
+	}
+	for _, r := range ran {
+		b.WriteString(r + "\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// earlierRecord returns the edited paths and command lines of the exact
+// record in a compaction summary (none for other messages).
+func earlierRecord(content string) (edited, ran []string) {
+	if !strings.HasPrefix(content, CompactedPrefix) && !strings.HasPrefix(content, TurnCompactedPrefix) {
+		return nil, nil
+	}
+	i := strings.Index(content, recordHeading)
+	if i < 0 {
+		return nil, nil
+	}
+	for _, line := range strings.Split(content[i:], "\n")[1:] {
+		switch {
+		case strings.HasPrefix(line, recordEdited):
+			edited = append(edited, strings.TrimPrefix(line, recordEdited))
+		case strings.HasPrefix(line, recordRan), strings.HasPrefix(line, "- ("):
+			ran = append(ran, line)
+		case strings.TrimSpace(line) == "":
+		default:
+			return edited, ran // the record ended
+		}
+	}
+	return edited, ran
+}
+
+// commandOutcome summarizes a run_command result: "exit 0", "exit 1",
+// "killed: timed out after 30s", "background proc-2", "not run", or "error".
+func commandOutcome(res string) string {
+	switch {
+	case strings.HasPrefix(res, "exit_code: "):
+		line, rest, _ := strings.Cut(res, "\n")
+		out := "exit " + strings.TrimPrefix(line, "exit_code: ")
+		if strings.HasPrefix(rest, "[killed:") {
+			if note, _, ok := strings.Cut(strings.TrimPrefix(rest, "["), "]"); ok {
+				out = note
+			}
+		}
+		return out
+	case strings.HasPrefix(res, "Started proc-"):
+		id, _, _ := strings.Cut(strings.TrimPrefix(res, "Started "), " ")
+		return "background " + id
+	case strings.HasPrefix(res, "Note: the user edited the command"):
+		if i := strings.Index(res, "exit_code: "); i >= 0 {
+			return commandOutcome(res[i:]) + " (edited by the user)"
+		}
+		return "run (edited by the user)"
+	case strings.HasPrefix(res, "Error:"):
+		return "error"
+	}
+	return "not run"
+}
+
+func oneLineClip(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > n {
+		return tools.TruncateUTF8(s, n) + "…"
+	}
+	return s
+}
+
 // elideToolOutputs shortens large tool results in history[from:], oldest
 // first, until the history's raw estimate is at most target tokens; the two
-// most recent results are always kept. It is used when a single turn fills
-// the context. It returns the new history and how many results it shortened.
-func elideToolOutputs(history []llm.Message, from, target int) ([]llm.Message, int) {
+// most recent results are always kept. The full results move to the output
+// store, so the model can read them back with read_output instead of
+// re-running a tool (which, for a command, could repeat its side effects).
+// It returns the new history and how many results it shortened.
+func (a *Agent) elideToolOutputs(history []llm.Message, from, target int) ([]llm.Message, int) {
 	const keepRecent = 2
 	const minSize = 2048
 	out := append([]llm.Message(nil), history...)
@@ -291,8 +602,9 @@ func elideToolOutputs(history []llm.Message, from, target int) ([]llm.Message, i
 			continue
 		}
 		total -= llm.EstimateMessageTokens(out[i])
-		out[i].Content = fmt.Sprintf("%s %d bytes of %s output removed to free context. Re-run the tool if you need it again.]\n%s",
-			elidedPrefix, len(out[i].Content), out[i].ToolName, tools.TruncateUTF8(out[i].Content, 400))
+		id := a.outputs.put(out[i].Content)
+		out[i].Content = fmt.Sprintf("%s %d bytes of %s output moved out of the context as %s; read_output(%q) returns any part of it.]\n%s",
+			elidedPrefix, len(out[i].Content), out[i].ToolName, id, id, tools.TruncateUTF8(out[i].Content, 400))
 		total += llm.EstimateMessageTokens(out[i])
 		n++
 	}
@@ -329,6 +641,10 @@ func renderTranscript(msgs []llm.Message, maxBytes int) string {
 		case llm.RoleTool:
 			b.WriteString("RESULT (" + m.ToolName + "): " + clip(m.Content, 1500) + "\n\n")
 		case llm.RoleSystem:
+			if strings.HasPrefix(m.Content, TurnCompactedPrefix) {
+				b.WriteString("EARLIER PROGRESS SUMMARY: " + clip(m.Content, 8000) + "\n\n")
+				continue
+			}
 			b.WriteString("NOTE: " + clip(m.Content, 800) + "\n\n")
 		}
 	}
