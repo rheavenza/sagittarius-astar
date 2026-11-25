@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -34,7 +35,7 @@ func TestCommitWriteRejectsStaleProposal(t *testing.T) {
 	if err := os.WriteFile(path, []byte("one\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, pw, _ := Execute(llm.ToolCall{Name: "edit_file", Args: map[string]any{
+	_, pw, _ := Execute(context.Background(), llm.ToolCall{Name: "edit_file", Args: map[string]any{
 		"path": path, "old_content": "one", "new_content": "two",
 	}})
 	if pw == nil {
@@ -50,7 +51,7 @@ func TestCommitWriteRejectsStaleProposal(t *testing.T) {
 	}
 
 	// A fresh proposal commits fine.
-	_, pw, _ = Execute(llm.ToolCall{Name: "write_file", Args: map[string]any{
+	_, pw, _ = Execute(context.Background(), llm.ToolCall{Name: "write_file", Args: map[string]any{
 		"path": path, "content": "fresh",
 	}})
 	if err := CommitWrite(*pw); err != nil {
@@ -101,7 +102,7 @@ func TestSearchRegexSkipsIgnoredDirsAndBinaries(t *testing.T) {
 	must("node_modules/pkg/index.js", "needle in deps")
 	must("bin/blob", "needle\x00binary")
 
-	out, _, err := Execute(llm.ToolCall{Name: "search_regex", Args: map[string]any{"pattern": "needle", "dir": root}})
+	out, _, err := Execute(context.Background(), llm.ToolCall{Name: "search_regex", Args: map[string]any{"pattern": "needle", "dir": root}})
 	if err != nil {
 		t.Fatal(err)
 	}

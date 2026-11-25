@@ -120,25 +120,44 @@ func (t *turn) execute(ctx context.Context, call llm.ToolCall) outcome {
 		return t.write(ctx, call)
 	}
 
+	// A fetch into the local machine or a private network (localhost, LAN,
+	// tailnet, cloud metadata) always asks, even in auto mode; only an
+	// approved call may reach one.
+	private, why := false, ""
+	if call.Name == "web_fetch" || call.Name == "web_scrape" {
+		u, _ := call.Args["url"].(string)
+		private, why = tools.PrivateURL(ctx, u)
+	}
+	execCtx := ctx
 	asked := false
-	if !auto {
+	if !auto || private {
 		if need, reason := tools.NeedsApproval(call, a.workspaceRoot); need {
 			asked = true
-			req := newRequest(&ApprovalRequest{Kind: ApproveTool, Call: call, Title: call.Name + " — " + reason, Risk: risk})
+			title := call.Name + " — " + reason
+			if private {
+				title = "⚠ " + title + " (" + why + ")"
+				if auto {
+					title += " — confirmation required even in auto mode"
+				}
+			}
+			req := newRequest(&ApprovalRequest{Kind: ApproveTool, Call: call, Title: title, Risk: risk})
 			if rep, ok := t.ask(ctx, req); !ok {
 				return deniedBy(rep, deniedToolMsg)
+			}
+			if private {
+				execCtx = tools.WithPrivateNetwork(ctx)
 			}
 		}
 	}
 	t.emit(ToolStartEvent{Call: call, Auto: !asked})
-	res, _, err := tools.Execute(call)
+	res, _, err := tools.Execute(execCtx, call)
 	return outcome{result: res, err: err}
 }
 
 // write prepares a file change, asks for approval with a diff, commits it and
 // runs the post-edit check.
 func (t *turn) write(ctx context.Context, call llm.ToolCall) outcome {
-	_, pw, err := tools.Execute(call)
+	_, pw, err := tools.Execute(ctx, call)
 	if pw == nil {
 		if err == nil || errors.Is(err, tools.ErrWriteConfirmationRequired) {
 			err = fmt.Errorf("%s: failed to prepare write", call.Name)

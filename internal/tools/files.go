@@ -158,7 +158,7 @@ func joinDisplay(dir, rel string) string {
 // searchFiles implements search_regex: ripgrep when available (fast,
 // .gitignore-aware, skips binaries), otherwise a Go fallback over
 // listProjectFiles.
-func searchFiles(pattern, dir, fileGlob string, caseInsensitive bool) (string, error) {
+func searchFiles(ctx context.Context, pattern, dir, fileGlob string, caseInsensitive bool) (string, error) {
 	if caseInsensitive && !strings.HasPrefix(pattern, "(?i)") {
 		pattern = "(?i)" + pattern
 	}
@@ -170,7 +170,7 @@ func searchFiles(pattern, dir, fileGlob string, caseInsensitive bool) (string, e
 	var matches []string
 	truncated := false
 	if rg, err := exec.LookPath("rg"); err == nil {
-		matches, truncated, err = ripgrep(rg, pattern, dir, fileGlob)
+		matches, truncated, err = ripgrep(ctx, rg, pattern, dir, fileGlob)
 		if err != nil {
 			return "", err
 		}
@@ -191,8 +191,8 @@ func searchFiles(pattern, dir, fileGlob string, caseInsensitive bool) (string, e
 	return out, nil
 }
 
-func ripgrep(rg, pattern, dir, fileGlob string) ([]string, bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), searchTimeout)
+func ripgrep(ctx context.Context, rg, pattern, dir, fileGlob string) ([]string, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 	args := []string{"--line-number", "--no-heading", "--color=never", "--max-columns=300", "--max-columns-preview"}
 	if fileGlob != "" {

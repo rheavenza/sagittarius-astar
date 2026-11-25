@@ -362,7 +362,9 @@ Prefer specific, targeted commands. Avoid commands that start interactive sessio
 // For run_command it returns ErrWriteConfirmationRequired so the TUI can gate
 // execution through its approval flow; the sandbox.Options are embedded in the
 // returned PendingWrite with Path="" to signal "command, not a file".
-func Execute(call llm.ToolCall) (result string, pw *PendingWrite, err error) {
+//
+// ctx cancels network requests and searches (Ctrl+C).
+func Execute(ctx context.Context, call llm.ToolCall) (result string, pw *PendingWrite, err error) {
 	switch call.Name {
 
 	// ── read_file ────────────────────────────────────────────────────────────
@@ -510,7 +512,7 @@ func Execute(call llm.ToolCall) (result string, pw *PendingWrite, err error) {
 		fileGlob, _ := call.Args["file_glob"].(string)
 
 		caseInsensitive, _ := call.Args["case_insensitive"].(bool)
-		out, err := searchFiles(pattern, dir, fileGlob, caseInsensitive)
+		out, err := searchFiles(ctx, pattern, dir, fileGlob, caseInsensitive)
 		if err != nil {
 			return "", nil, err
 		}
@@ -554,7 +556,7 @@ func Execute(call llm.ToolCall) (result string, pw *PendingWrite, err error) {
 
 	// ── repo_map ─────────────────────────────────────────────────────────────
 	case "repo_map":
-		return repoMap(call)
+		return repoMap(ctx, call)
 
 	// ── web_search ───────────────────────────────────────────────────────────
 	case "web_search":
@@ -563,8 +565,8 @@ func Execute(call llm.ToolCall) (result string, pw *PendingWrite, err error) {
 			return "", nil, fmt.Errorf("web_search: missing query parameter")
 		}
 
-		client := &http.Client{Timeout: 10 * time.Second}
-		req, err := http.NewRequest("POST", "https://lite.duckduckgo.com/lite/",
+		client := guardedClient(ctx, 10*time.Second)
+		req, err := http.NewRequestWithContext(ctx, "POST", "https://lite.duckduckgo.com/lite/",
 			strings.NewReader("q="+url.QueryEscape(query)))
 		if err != nil {
 			return "", nil, err
@@ -630,8 +632,11 @@ func Execute(call llm.ToolCall) (result string, pw *PendingWrite, err error) {
 			return "", nil, fmt.Errorf("web_fetch: missing url parameter")
 		}
 
-		client := &http.Client{Timeout: 15 * time.Second}
-		req, err := http.NewRequest("GET", targetURL, nil)
+		if err := checkFetchTarget(ctx, targetURL); err != nil {
+			return "", nil, err
+		}
+		client := guardedClient(ctx, 15*time.Second)
+		req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 		if err != nil {
 			return "", nil, err
 		}

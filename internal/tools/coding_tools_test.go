@@ -75,7 +75,7 @@ func TestMultiEditIsAtomic(t *testing.T) {
 			map[string]any{"old_content": "gamma", "new_content": "GAMMA"},
 		},
 	}}
-	_, pw, err := Execute(call)
+	_, pw, err := Execute(context.Background(), call)
 	if err != ErrWriteConfirmationRequired || pw == nil {
 		t.Fatalf("expected pending write, got %v", err)
 	}
@@ -87,7 +87,7 @@ func TestMultiEditIsAtomic(t *testing.T) {
 		map[string]any{"old_content": "alpha", "new_content": "ALPHA"},
 		map[string]any{"old_content": "missing", "new_content": "x"},
 	}
-	if _, pw, err := Execute(call); pw != nil || err == nil || !strings.Contains(err.Error(), "edit #2") {
+	if _, pw, err := Execute(context.Background(), call); pw != nil || err == nil || !strings.Contains(err.Error(), "edit #2") {
 		t.Fatalf("a failing edit must reject the whole batch: pw=%v err=%v", pw, err)
 	}
 }
@@ -98,7 +98,7 @@ func TestReadFileNumbersLines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "f.go")
 	os.WriteFile(path, []byte("package x\n\nfunc A() {}\n"), 0o644)
 
-	out, _, err := Execute(llm.ToolCall{Name: "read_file", Args: map[string]any{"path": path}})
+	out, _, err := Execute(context.Background(), llm.ToolCall{Name: "read_file", Args: map[string]any{"path": path}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestReadFileNumbersLines(t *testing.T) {
 		t.Fatalf("unexpected output:\n%q", out)
 	}
 
-	out, _, _ = Execute(llm.ToolCall{Name: "read_file", Args: map[string]any{"path": path, "start_line": float64(3)}})
+	out, _, _ = Execute(context.Background(), llm.ToolCall{Name: "read_file", Args: map[string]any{"path": path, "start_line": float64(3)}})
 	if !strings.Contains(out, "lines 3-3 of 3") || !strings.Contains(out, "     3\tfunc A() {}") {
 		t.Fatalf("range read:\n%s", out)
 	}
@@ -115,7 +115,7 @@ func TestReadFileNumbersLines(t *testing.T) {
 func TestReadFileTruncatesOnLineBoundary(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "big.txt")
 	os.WriteFile(path, []byte(strings.Repeat(strings.Repeat("x", 99)+"\n", 2000)), 0o644)
-	out, _, _ := Execute(llm.ToolCall{Name: "read_file", Args: map[string]any{"path": path}})
+	out, _, _ := Execute(context.Background(), llm.ToolCall{Name: "read_file", Args: map[string]any{"path": path}})
 	if len(out) > maxReadBytes+200 || !strings.Contains(out, "continue with start_line=") {
 		t.Fatalf("not truncated properly: %d bytes", len(out))
 	}

@@ -16,7 +16,7 @@ const (
 	repoMapTimeout       = 30 * time.Second
 )
 
-func repoMap(call llm.ToolCall) (string, *PendingWrite, error) {
+func repoMap(ctx context.Context, call llm.ToolCall) (string, *PendingWrite, error) {
 	dir, _ := call.Args["dir"].(string)
 	if dir == "" {
 		dir = "."
@@ -27,7 +27,7 @@ func repoMap(call llm.ToolCall) (string, *PendingWrite, error) {
 	}
 	focus := stringList(call.Args["focus"])
 
-	ctx, cancel := context.WithTimeout(context.Background(), repoMapTimeout)
+	ctx, cancel := context.WithTimeout(ctx, repoMapTimeout)
 	defer cancel()
 	m, err := repomap.Build(ctx, dir)
 	if err != nil {

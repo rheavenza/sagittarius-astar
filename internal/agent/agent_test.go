@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -556,6 +558,37 @@ func TestAutoModeAsksBeforeReusingCachedSudoPassword(t *testing.T) {
 	assertAllCallsAnswered(t, msgs)
 	if len(asked) != 1 || asked[0].Kind != ApproveCommand || !strings.Contains(asked[0].Title, "sudo") {
 		t.Fatalf("auto mode should confirm a sudo command that reuses the cached password, asked: %+v", asked)
+	}
+}
+
+func TestAutoModeAsksBeforeFetchingPrivateAddresses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<p>router admin</p>"))
+	}))
+	defer srv.Close()
+	p := &fakeProvider{replies: []reply{
+		{calls: []llm.ToolCall{{ID: "1", Name: "web_fetch", Args: map[string]any{"url": srv.URL}}}},
+		{tokens: []string{"ok"}},
+	}}
+	a := New(Options{Provider: p, WorkspaceRoot: t.TempDir()})
+	a.SetMode(ModeAuto)
+	var asked []*ApprovalRequest
+	evs, msgs := collect(t, a.Run(context.Background(), user("go")), func(r *ApprovalRequest) {
+		asked = append(asked, r)
+		r.Approve("")
+	})
+	done(t, evs)
+	if len(asked) != 1 || !strings.Contains(asked[0].Title, "private address") {
+		t.Fatalf("auto mode should confirm a fetch to %s, asked: %+v", srv.URL, asked)
+	}
+	var result string
+	for _, m := range msgs {
+		if m.Role == llm.RoleTool {
+			result = m.Content
+		}
+	}
+	if !strings.Contains(result, "router admin") {
+		t.Fatalf("approved private fetch should run, got %q", result)
 	}
 }
 
