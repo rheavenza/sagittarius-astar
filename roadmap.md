@@ -117,7 +117,8 @@ Prerequisite for headless mode, subagents and proper tests.
     the turn.
   - It gets 20 rounds; after that it must answer with no tools offered.
   - Allowed in plan mode.
-  - Later: a separate cheaper model for subagents, and running several explore calls in parallel.
+  - ✅ Several explore calls run in parallel (with the other read-only calls of a response).
+  - Later: a separate cheaper model for subagents.
 - ⬜ **Semantic search** (postponed): embeddings (NIM / Gemini) in SQLite with a
   `semantic_search` tool. Revisit after Phase 6, once there's real usage data for
   `repo_map` + `explore` + `project_overview`.
@@ -154,5 +155,10 @@ Prerequisite for headless mode, subagents and proper tests.
   suggestion line; works in `aig -p` too; `/read(x)` still accepted.
 - ⬜ Token/cost meter, session search.
 - ⬜ Real isolation for commands (bubblewrap / Landlock / distrobox).
-- ⬜ Proper search API (SearXNG / Brave), HTML → markdown, parallel read-only tools.
+- ✅ Parallel read-only tool calls (up to 8 at a time, results kept in order).
+- ✅ `update_plan`: the agent's task checklist, shown in the TUI and status bar, carried through compaction.
+- ✅ `ask_user`: structured questions mid-task (options or free text); headless runs tell the model to assume.
+- ✅ Background processes: `run_command` `background: true`, `read_process_output` (wait for a pattern), `kill_process`, all stopped on exit.
+- ✅ Compaction inside one long turn, an exact record of edits/commands/plan in every summary, outputs kept for `read_output` when shortened, a 200k-token cap for large windows, `compact_model`.
+- ⬜ Proper search API (SearXNG / Brave), HTML → markdown.
 - ⬜ API keys in KWallet / libsecret; per-folder command allowlists.
