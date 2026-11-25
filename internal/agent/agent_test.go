@@ -270,8 +270,11 @@ func TestErrorLoopBreaker(t *testing.T) {
 	bad := func(id string) llm.ToolCall {
 		return llm.ToolCall{ID: id, Name: "read_file", Args: map[string]any{"path": "missing-" + id}}
 	}
+	// The three reads run as one parallel group; the command after them is
+	// skipped because they all failed.
 	p := &fakeProvider{replies: []reply{
-		{calls: []llm.ToolCall{bad("1"), bad("2"), bad("3"), bad("4")}},
+		{calls: []llm.ToolCall{bad("1"), bad("2"), bad("3"),
+			{ID: "4", Name: "run_command", Args: map[string]any{"command": "echo should-not-run"}}}},
 		{tokens: []string{"ok"}},
 	}}
 	dir := t.TempDir()

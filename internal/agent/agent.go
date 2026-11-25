@@ -101,6 +101,10 @@ type Agent struct {
 	budget         budget
 	outputs        outputStore
 	checkpoints    Checkpointer
+	plan           planState
+	procs          procTable
+	// compactProvider writes compaction summaries; nil = the session model.
+	compactProvider llm.Provider
 
 	mode     atomic.Int32 // Mode
 	planMode atomic.Bool
@@ -273,6 +277,7 @@ func (a *Agent) Run(ctx context.Context, history []llm.Message) <-chan Event {
 		t.tailNote = planDirective
 	}
 	a.mu.Unlock()
+	a.plan.set(PlanFromHistory(history))
 
 	go func() {
 		defer close(ch)
@@ -302,6 +307,9 @@ type turn struct {
 	checkpointed  bool   // a checkpoint was taken this turn
 	compactFailed bool   // a summary request failed: don't retry this turn
 	compactWarned bool   // "nothing to compact" was reported this turn
+	// turnSummaryFailed: summarizing this turn's rounds failed once; shorten
+	// tool outputs instead for the rest of the turn.
+	turnSummaryFailed bool
 
 	// sub marks an explore subagent turn: it never asks for approval and
 	// only gets toolDefs.
@@ -395,6 +403,10 @@ func (t *turn) stream(ctx context.Context) (text, reasoning string, calls []llm.
 		if len(t.a.projectChecks.Checks) > 0 {
 			defs = append(defs, tools.RunChecksDefinition(t.a.projectChecks))
 		}
+		defs = append(defs, updatePlanDefinition(), askUserDefinition())
+		if t.a.procs.any() {
+			defs = append(defs, readProcessOutputDefinition(), killProcessDefinition())
+		}
 		if t.planMode {
 			defs = readOnlyDefs(defs)
 		} else if t.a.mcp != nil {
@@ -485,51 +497,55 @@ func (t *turn) stream(ctx context.Context) (text, reasoning string, calls []llm.
 	return split.Content(), reasoning, res.calls, nil
 }
 
-// runCalls executes a batch of tool calls. It returns true when the turn is
-// over (aborted); false means "stream again".
+// runCalls executes a batch of tool calls. Consecutive calls that only read
+// (see parallelSafe) run concurrently; their results are still recorded in
+// call order, and the loop breakers count them in that order too. It returns
+// true when the turn is over (aborted); false means "stream again".
 func (t *turn) runCalls(ctx context.Context, calls []llm.ToolCall) bool {
-	for i, call := range calls {
-		h := hashArguments(call.Args)
-		if call.Name == t.lastName && h == t.lastHash {
-			t.sameCount++
-		} else {
-			t.sameCount, t.lastName, t.lastHash = 1, call.Name, h
-		}
-		if t.sameCount >= breakerLimit {
-			t.answer(calls[i:], "Skipped: loop breaker blocked a repeated identical call.")
-			t.appendMsg(llm.Message{Role: llm.RoleSystem, Content: fmt.Sprintf(
-				"Loop breaker: you called %q with the same arguments %d times in a row, so the call was blocked. "+
-					"Stop repeating it; re-check your assumptions (paths, arguments, earlier output) and choose a different approach.",
-				call.Name, breakerLimit)})
-			t.emit(NoticeEvent{Level: NoticeWarn, Text: fmt.Sprintf("Loop breaker: blocked %d identical calls to %s", breakerLimit, call.Name)})
-			t.sameCount, t.lastName, t.lastHash = 0, "", ""
+	for i := 0; i < len(calls); {
+		if t.repeatedCall(calls[i]) {
+			t.blockRepeated(calls, i)
 			return false
 		}
+		end, tripAt := i+1, -1
+		if t.parallelSafe(calls[i]) {
+			for end < len(calls) && end-i < maxParallelCalls && t.parallelSafe(calls[end]) {
+				if t.repeatedCall(calls[end]) {
+					tripAt = end
+					break
+				}
+				end++
+			}
+		}
 
-		out := t.execute(ctx, call)
+		outs := t.executeGroup(ctx, calls[i:end])
 
-		if ctx.Err() != nil {
+		errTrip := false
+		for k, out := range outs {
+			call := calls[i+k]
 			content := out.content()
-			if content == "" {
+			if ctx.Err() != nil && content == "" {
 				content = "Aborted by user."
 			}
 			t.emit(ToolResultEvent{Call: call, Result: out.result, Err: out.err, Denied: out.denied})
 			t.appendToolResult(call, t.a.shrinkOutput(call.Name, content))
-			t.answer(calls[i+1:], "Aborted by user before execution.")
+			if out.err != nil {
+				t.errCount++
+			} else {
+				t.errCount = 0
+			}
+			if t.errCount >= breakerLimit {
+				errTrip = true
+			}
+		}
+
+		if ctx.Err() != nil {
+			t.answer(calls[end:], "Aborted by user before execution.")
 			t.emit(DoneEvent{Aborted: true})
 			return true
 		}
-
-		t.emit(ToolResultEvent{Call: call, Result: out.result, Err: out.err, Denied: out.denied})
-		t.appendToolResult(call, t.a.shrinkOutput(call.Name, out.content()))
-
-		if out.err != nil {
-			t.errCount++
-		} else {
-			t.errCount = 0
-		}
-		if t.errCount >= breakerLimit {
-			t.answer(calls[i+1:], "Skipped: loop breaker halted execution after consecutive errors.")
+		if errTrip {
+			t.answer(calls[end:], "Skipped: loop breaker halted execution after consecutive errors.")
 			t.appendMsg(llm.Message{Role: llm.RoleSystem, Content: fmt.Sprintf(
 				"Loop breaker: the last %d tool calls failed, so the remaining calls in this batch were skipped. "+
 					"Read the errors, fix the cause (syntax, paths, arguments) and reconsider your approach before trying again.",
@@ -538,8 +554,79 @@ func (t *turn) runCalls(ctx context.Context, calls []llm.ToolCall) bool {
 			t.errCount = 0
 			return false
 		}
+		if tripAt >= 0 {
+			t.blockRepeated(calls, tripAt)
+			return false
+		}
+		i = end
 	}
 	return false
+}
+
+// maxParallelCalls bounds how many read-only calls run at once.
+const maxParallelCalls = 8
+
+// repeatedCall records call for the same-call loop breaker and reports
+// whether it is the breakerLimit-th identical call in a row.
+func (t *turn) repeatedCall(call llm.ToolCall) bool {
+	h := hashArguments(call.Args)
+	if call.Name == t.lastName && h == t.lastHash {
+		t.sameCount++
+	} else {
+		t.sameCount, t.lastName, t.lastHash = 1, call.Name, h
+	}
+	return t.sameCount >= breakerLimit
+}
+
+// blockRepeated answers calls[i:] after the same-call breaker tripped on calls[i].
+func (t *turn) blockRepeated(calls []llm.ToolCall, i int) {
+	call := calls[i]
+	t.answer(calls[i:], "Skipped: loop breaker blocked a repeated identical call.")
+	t.appendMsg(llm.Message{Role: llm.RoleSystem, Content: fmt.Sprintf(
+		"Loop breaker: you called %q with the same arguments %d times in a row, so the call was blocked. "+
+			"Stop repeating it; re-check your assumptions (paths, arguments, earlier output) and choose a different approach.",
+		call.Name, breakerLimit)})
+	t.emit(NoticeEvent{Level: NoticeWarn, Text: fmt.Sprintf("Loop breaker: blocked %d identical calls to %s", breakerLimit, call.Name)})
+	t.sameCount, t.lastName, t.lastHash = 0, "", ""
+}
+
+// parallelSafe reports whether call can run concurrently with its
+// neighbours: a local read-only tool (or web_search) that needs no approval.
+// Anything that asks, writes, runs, or talks to the user runs alone.
+func (t *turn) parallelSafe(call llm.ToolCall) bool {
+	if t.a.mcp != nil && t.a.mcp.IsMCPTool(call.Name) {
+		return false
+	}
+	switch call.Name {
+	case "update_plan", "ask_user", "read_process_output", "kill_process":
+		return false
+	}
+	r, ok := tools.RiskOf(call.Name)
+	if !ok || (r != tools.RiskRead && call.Name != "web_search") {
+		return false
+	}
+	need, _ := tools.NeedsApproval(call, t.a.workspaceRoot)
+	return !need
+}
+
+// executeGroup runs calls (one, or several parallel-safe ones) and returns
+// their outcomes in order.
+func (t *turn) executeGroup(ctx context.Context, calls []llm.ToolCall) []outcome {
+	outs := make([]outcome, len(calls))
+	if len(calls) == 1 {
+		outs[0] = t.execute(ctx, calls[0])
+		return outs
+	}
+	var wg sync.WaitGroup
+	for k, call := range calls {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			outs[k] = t.execute(ctx, call)
+		}()
+	}
+	wg.Wait()
+	return outs
 }
 
 // SkippedToolResults builds a tool-result message for each call.

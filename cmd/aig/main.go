@@ -411,6 +411,17 @@ func setup() (_ *runtime, err error) {
 		}
 	}
 	ag.SetContextWindow(llm.ContextWindow(cfg.Model, fc.ContextWindows))
+	ag.SetCompactAt(fc.CompactAtTokens)
+	if spec := strings.TrimSpace(fc.CompactModel); spec != "" {
+		if name, model, ep, err := config.ResolveModelSpec(spec, cfg.Provider); err != nil {
+			logger.L.Warn("compact_model ignored", "value", spec, "error", err)
+		} else if cp, err := llm.NewProvider(string(name), ep.APIKey, model, ep.BaseURL); err != nil {
+			logger.L.Warn("compact_model ignored", "value", spec, "error", err)
+		} else {
+			ag.SetCompactProvider(cp)
+		}
+	}
+	rt.closers = append(rt.closers, ag.Close) // stop background processes on exit
 
 	rt.cfg, rt.session, rt.provider, rt.agent, rt.checkpoints = cfg, activeSession, provider, ag, checkpoints
 	return rt, nil

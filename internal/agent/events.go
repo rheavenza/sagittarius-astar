@@ -119,6 +119,9 @@ const (
 	// ApproveSudoPassword: the command needs sudo and no graphical askpass
 	// helper is available; the reply carries the password.
 	ApproveSudoPassword
+	// ApproveQuestion: ask_user. Question and Options hold what the model
+	// asks; answer with Answer (or Deny when the user won't answer).
+	ApproveQuestion
 )
 
 // ApprovalRequest is answered exactly once via Approve, ProvidePassword or Deny.
@@ -130,6 +133,9 @@ type ApprovalRequest struct {
 	Write   *tools.PendingWrite // ApproveWrite
 	Risk    tools.Risk
 
+	Question string   // ApproveQuestion
+	Options  []string // ApproveQuestion: suggested answers (may be empty)
+
 	reply chan ApprovalReply
 	once  sync.Once
 }
@@ -139,6 +145,7 @@ type ApprovalReply struct {
 	Approved bool
 	Command  string // edited command (ApproveCommand); "" keeps the original
 	Password string // ApproveSudoPassword
+	Answer   string // ApproveQuestion
 	// Reason, on a denial, replaces the default "the user denied it" tool
 	// result (e.g. headless mode explains that nobody could be asked).
 	Reason string
@@ -162,6 +169,11 @@ func (r *ApprovalRequest) Approve(command string) {
 // ProvidePassword answers an ApproveSudoPassword request.
 func (r *ApprovalRequest) ProvidePassword(password string) {
 	r.send(ApprovalReply{Approved: true, Password: password})
+}
+
+// Answer answers an ApproveQuestion request.
+func (r *ApprovalRequest) Answer(text string) {
+	r.send(ApprovalReply{Approved: true, Answer: text})
 }
 
 // Deny rejects the request.

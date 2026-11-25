@@ -108,6 +108,18 @@ func (t *turn) execute(ctx context.Context, call llm.ToolCall) outcome {
 	case "read_output":
 		t.emit(ToolStartEvent{Call: call, Auto: true})
 		return t.a.readOutput(call)
+	case "update_plan":
+		if t.sub {
+			return deniedOutcome("Subagents have no plan; answer the question.")
+		}
+		return t.updatePlan(call)
+	case "ask_user":
+		return t.askUser(ctx, call)
+	case "read_process_output":
+		return t.readProcessOutput(ctx, call)
+	case "kill_process":
+		// Only the agent's own background processes: no approval needed.
+		return t.killProcess(call)
 	}
 
 	switch risk {
@@ -206,6 +218,10 @@ func (t *turn) runCommand(ctx context.Context, call llm.ToolCall, auto bool) out
 		return outcome{err: fmt.Errorf("run_command: missing 'command' argument")}
 	}
 	command := original
+	background, _ := call.Args["background"].(bool)
+	if background && sandbox.NeedsPassword(command) {
+		return outcome{err: fmt.Errorf("run_command: a background command can't prompt for a sudo password; run the sudo part in the foreground first")}
+	}
 
 	title := "run_command"
 	if auto {
@@ -218,6 +234,9 @@ func (t *turn) runCommand(ctx context.Context, call llm.ToolCall, auto bool) out
 			auto = false
 			title = "⚠ sudo command — confirmation required even in auto mode (the cached sudo password would be reused)"
 		}
+	}
+	if background {
+		title += " (background)"
 	}
 	if !auto {
 		req := newRequest(&ApprovalRequest{Kind: ApproveCommand, Call: call, Title: title, Command: command, Risk: tools.RiskExec})
@@ -232,6 +251,9 @@ func (t *turn) runCommand(ctx context.Context, call llm.ToolCall, auto bool) out
 
 	password := ""
 	if sandbox.NeedsPassword(command) {
+		if background { // the user added sudo while editing the command
+			return outcome{err: fmt.Errorf("run_command: a background command can't prompt for a sudo password; run the sudo part in the foreground first")}
+		}
 		password = a.cachedSudoPassword()
 		if password == "" {
 			req := newRequest(&ApprovalRequest{Kind: ApproveSudoPassword, Call: call, Title: "sudo password", Command: command, Risk: tools.RiskExec})
@@ -253,6 +275,14 @@ func (t *turn) runCommand(ctx context.Context, call llm.ToolCall, auto bool) out
 	run.Args["command"] = command
 
 	t.ensureCheckpoint()
+	if background {
+		t.emit(ToolStartEvent{Call: run, Command: command, Auto: auto})
+		out := t.startBackground(run, command)
+		if out.err == nil && command != original {
+			out.result = fmt.Sprintf("Note: the user edited the command before running it. Executed:\n%s\n\n%s", command, out.result)
+		}
+		return out
+	}
 	pipeR, pipeW := io.Pipe()
 	defer pipeW.Close()
 	t.emit(ToolStartEvent{Call: run, Command: command, Stdin: pipeW, Auto: auto})
