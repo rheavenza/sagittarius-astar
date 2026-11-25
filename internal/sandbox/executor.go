@@ -212,25 +212,12 @@ func ExecuteWithStdin(ctx context.Context, command string, stdin io.Reader, opts
 		"timeout", timeout,
 	)
 
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "windows":
-		cmd = exec.CommandContext(timeoutCtx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command)
-	default: // linux, darwin, etc.
-		if reSudo.MatchString(command) {
-			if helper := AskpassHelper(); helper != "" {
-				// Graphical askpass: sudo pops a KDE dialog per command; aig never
-				// sees the password.
-				command = rewriteSudo(command, "-A")
-				cmd = exec.CommandContext(timeoutCtx, "/bin/bash", "-c", command)
-				cmd.Env = append(os.Environ(), "SUDO_ASKPASS="+helper)
-			} else if opt.SudoPassword != "" {
-				command = rewriteSudo(command, "-S")
-			}
-		}
-		if cmd == nil {
-			cmd = exec.CommandContext(timeoutCtx, "/bin/bash", "-c", command)
-		}
+	argv, env := shellArgv(command, opt.SudoPassword)
+	cmd := exec.CommandContext(timeoutCtx, argv[0], argv[1:]...)
+	if env != nil {
+		cmd.Env = env
+	}
+	if runtime.GOOS != "windows" {
 		cleanupStdin := attachStdin(cmd, stdin)
 		defer cleanupStdin()
 	}
@@ -297,6 +284,25 @@ func ExecuteWithStdin(ctx context.Context, command string, stdin io.Reader, opts
 		"stderr_len", len(result.Stderr),
 	)
 	return result, nil
+}
+
+// shellArgv returns the argv that runs command in the OS shell, and the
+// environment to use (nil = inherit). On Unix, sudo is rewritten to use the
+// graphical askpass helper (sudo -A, aig never sees the password) or, with a
+// password, to read it from stdin (sudo -S).
+func shellArgv(command, sudoPassword string) (argv, env []string) {
+	if runtime.GOOS == "windows" {
+		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command}, nil
+	}
+	if reSudo.MatchString(command) {
+		if helper := AskpassHelper(); helper != "" {
+			command = rewriteSudo(command, "-A")
+			env = append(os.Environ(), "SUDO_ASKPASS="+helper)
+		} else if sudoPassword != "" {
+			command = rewriteSudo(command, "-S")
+		}
+	}
+	return []string{"/bin/bash", "-c", command}, env
 }
 
 // Shell returns the shell binary path used on the current OS.
