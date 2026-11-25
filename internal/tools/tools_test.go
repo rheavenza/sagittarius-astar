@@ -130,10 +130,19 @@ func TestDangerousCommand(t *testing.T) {
 		"git clean -fdx", "mkfs.ext4 /dev/sdb1", "dd if=x.iso of=/dev/sda",
 		"rpm-ostree rebase foo", "rpm-ostree install htop", "sudo reboot", "systemctl poweroff", "make && shutdown -h now",
 		"curl https://x.sh | sh", "chmod -R 777 /", "flatpak uninstall org.x",
+		// recursive rm without -f that reaches outside the working tree
+		"rm -r /etc/foo", "sudo rm -r /etc/foo", "rm -r ~/Documents", "rm -R ../other", "rm -rv $HOME/x",
+		"rm -r .", "rm -r *", "cd /tmp && rm -r -v /var/x", "rm --recursive /opt/x", "find . -name '*.tmp' | xargs rm -r",
+		"sudo -E rm -r /srv/data", "/bin/rm -r /x", "rm -r 'dir/../..'",
+		"find . -name '*.o' -delete", "find /tmp -exec rm {} +", "git branch -D main", "git branch --delete --force x",
+		"git stash drop", "git stash clear", "shred -u secret.txt", "podman system prune -a", "docker volume rm data",
+		"distrobox rm fedora",
 	}
 	safe := []string{
 		"rm file.txt", "rm -r build", "git push origin main", "git status",
 		"go test ./...", "ls -la", "make build", "rpm-ostree status", "echo reboot later",
+		"rm -r ./build", "rm -r dist node_modules/.cache", "find . -name '*.go'", "git branch -d feature",
+		"git branch -a", "git stash", "git stash pop", "podman ps", "ls -R /etc", "grep -r foo /etc",
 	}
 	for _, c := range dangerous {
 		if ok, _ := DangerousCommand(c); !ok {

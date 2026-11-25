@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -528,6 +529,33 @@ func TestAutoModeStillAsksForDestructiveCommands(t *testing.T) {
 	}
 	if !a.AutoApprove() {
 		t.Error("AutoApprove should report true in auto mode")
+	}
+}
+
+func TestAutoModeAsksBeforeReusingCachedSudoPassword(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sudo is not used on Windows")
+	}
+	// No graphical session: sudo goes through aig's cached password.
+	t.Setenv("DISPLAY", "")
+	t.Setenv("WAYLAND_DISPLAY", "")
+	dir := t.TempDir()
+	p := &fakeProvider{replies: []reply{
+		{calls: []llm.ToolCall{{ID: "1", Name: "run_command", Args: map[string]any{"command": "sudo true"}}}},
+		{tokens: []string{"ok"}},
+	}}
+	a := New(Options{Provider: p, WorkspaceRoot: dir})
+	a.SetMode(ModeAuto)
+	a.setSudoPassword("hunter2")
+	var asked []*ApprovalRequest
+	evs, msgs := collect(t, a.Run(context.Background(), user("go")), func(r *ApprovalRequest) {
+		asked = append(asked, r)
+		r.Deny()
+	})
+	done(t, evs)
+	assertAllCallsAnswered(t, msgs)
+	if len(asked) != 1 || asked[0].Kind != ApproveCommand || !strings.Contains(asked[0].Title, "sudo") {
+		t.Fatalf("auto mode should confirm a sudo command that reuses the cached password, asked: %+v", asked)
 	}
 }
 

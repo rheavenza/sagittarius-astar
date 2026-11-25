@@ -193,6 +193,11 @@ func (t *turn) runCommand(ctx context.Context, call llm.ToolCall, auto bool) out
 		if bad, reason := tools.DangerousCommand(command); bad {
 			auto = false
 			title = "⚠ destructive command (" + reason + ") — confirmation required even in auto mode"
+		} else if sandbox.NeedsPassword(command) && a.cachedSudoPassword() != "" {
+			// Without a graphical askpass dialog the cached password would run
+			// this as root with nobody seeing it.
+			auto = false
+			title = "⚠ sudo command — confirmation required even in auto mode (the cached sudo password would be reused)"
 		}
 	}
 	if !auto {

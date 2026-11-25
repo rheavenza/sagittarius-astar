@@ -1,6 +1,9 @@
 package tools
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // Risk classifies what a tool can do. The agent's approval policy is based on
 // it, for native and MCP tools alike.
@@ -88,6 +91,86 @@ var dangerousPatterns = []struct {
 	{regexp.MustCompile(`\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z|fi)?sh\b`), "pipes a download into a shell"},
 	{regexp.MustCompile(`\bsystemctl\s+(disable|mask|stop)\b`), "disables or stops a service"},
 	{regexp.MustCompile(`\b(flatpak|dnf|brew)\s+(remove|uninstall|erase)\b`), "uninstalls software"},
+	{regexp.MustCompile(`\bfind\b.*\s-(delete|exec(dir)?\s+(sudo\s+)?rm)\b`), "deletes the files find matches"},
+	{regexp.MustCompile(`\bgit\s+branch\b.*\s(-[a-zA-Z]*D\b|--delete\b.*--force\b|--force\b.*--delete\b)`), "force-deletes a git branch"},
+	{regexp.MustCompile(`\bgit\s+stash\s+(drop|clear)\b`), "discards stashed changes"},
+	{regexp.MustCompile(`\b(shred|wipefs)\b`), "destroys data"},
+	{regexp.MustCompile(`\b(docker|podman)\s+((system|volume|image|container)\s+prune|volume\s+rm)\b`), "deletes containers, images or volumes"},
+	{regexp.MustCompile(`\bdistrobox\s+(rm|remove)\b`), "deletes a container"},
+}
+
+// reCmdSep splits a command line into simple commands (roughly: it doesn't
+// understand quoting, which only makes the check stricter).
+var reCmdSep = regexp.MustCompile(`&&|\|\||[;|&()\n]`)
+
+// riskyRecursiveRm reports a recursive rm (without -f, which the patterns
+// above catch) that reaches outside the working tree: an absolute or home
+// path, a parent directory, the whole current directory, a bare glob, or
+// targets fed in by xargs. `rm -r build` stays allowed: deleting a
+// directory inside the workspace is ordinary cleanup.
+func riskyRecursiveRm(command string) bool {
+	for _, seg := range reCmdSep.Split(command, -1) {
+		f := strings.Fields(seg)
+		i, xargs := commandWord(f)
+		if i < 0 {
+			continue
+		}
+		if name := f[i]; name != "rm" && !strings.HasSuffix(name, "/rm") && name != `\rm` {
+			continue
+		}
+		recursive := false
+		var targets []string
+		for _, a := range f[i+1:] {
+			switch {
+			case a == "--recursive":
+				recursive = true
+			case a == "--" || strings.HasPrefix(a, "--"):
+			case strings.HasPrefix(a, "-") && len(a) > 1:
+				if strings.ContainsAny(a[1:], "rR") {
+					recursive = true
+				}
+			default:
+				targets = append(targets, strings.Trim(a, `"'`))
+			}
+		}
+		if !recursive {
+			continue
+		}
+		if xargs {
+			return true
+		}
+		for _, t := range targets {
+			if strings.HasPrefix(t, "/") || strings.HasPrefix(t, "~") ||
+				strings.HasPrefix(t, "$HOME") || strings.HasPrefix(t, "${HOME}") ||
+				t == ".." || strings.HasPrefix(t, "../") || strings.Contains(t, "/../") || strings.HasSuffix(t, "/..") ||
+				t == "." || t == "./" || t == "*" || t == "./*" || t == ".*" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// commandWord returns the index of the program in a simple command's words,
+// skipping wrappers (sudo, env, xargs, …), their options and VAR=value
+// prefixes; xargs reports whether the program's arguments come from xargs.
+// i is -1 when there is no program word.
+func commandWord(f []string) (i int, xargs bool) {
+	for i = 0; i < len(f); i++ {
+		w := f[i]
+		switch {
+		case w == "sudo" || w == "command" || w == "env" || w == "nice" || w == "time":
+		case w == "xargs":
+			xargs = true
+		case i > 0 && strings.HasPrefix(w, "-"):
+			// an option of the wrapper before it (sudo -E, xargs -0, …)
+		case !strings.HasPrefix(w, "-") && strings.Contains(w, "="):
+			// VAR=value prefix
+		default:
+			return i, xargs
+		}
+	}
+	return -1, false
 }
 
 // DangerousCommand reports whether command is destructive enough that it
@@ -97,6 +180,9 @@ func DangerousCommand(command string) (bool, string) {
 		if p.re.MatchString(command) {
 			return true, p.reason
 		}
+	}
+	if riskyRecursiveRm(command) {
+		return true, "recursive delete outside the working tree"
 	}
 	return false, ""
 }
