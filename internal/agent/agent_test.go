@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +14,7 @@ import (
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tools"
+	"google.golang.org/genai"
 )
 
 // ── fake provider ────────────────────────────────────────────────────────────
@@ -528,6 +532,128 @@ func TestAutoModeStillAsksForDestructiveCommands(t *testing.T) {
 	}
 	if !a.AutoApprove() {
 		t.Error("AutoApprove should report true in auto mode")
+	}
+}
+
+func TestAutoModeAsksBeforeReusingCachedSudoPassword(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sudo is not used on Windows")
+	}
+	// No graphical session: sudo goes through aig's cached password.
+	t.Setenv("DISPLAY", "")
+	t.Setenv("WAYLAND_DISPLAY", "")
+	dir := t.TempDir()
+	p := &fakeProvider{replies: []reply{
+		{calls: []llm.ToolCall{{ID: "1", Name: "run_command", Args: map[string]any{"command": "sudo true"}}}},
+		{tokens: []string{"ok"}},
+	}}
+	a := New(Options{Provider: p, WorkspaceRoot: dir})
+	a.SetMode(ModeAuto)
+	a.setSudoPassword("hunter2")
+	var asked []*ApprovalRequest
+	evs, msgs := collect(t, a.Run(context.Background(), user("go")), func(r *ApprovalRequest) {
+		asked = append(asked, r)
+		r.Deny()
+	})
+	done(t, evs)
+	assertAllCallsAnswered(t, msgs)
+	if len(asked) != 1 || asked[0].Kind != ApproveCommand || !strings.Contains(asked[0].Title, "sudo") {
+		t.Fatalf("auto mode should confirm a sudo command that reuses the cached password, asked: %+v", asked)
+	}
+}
+
+func TestAutoModeAsksBeforeFetchingPrivateAddresses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<p>router admin</p>"))
+	}))
+	defer srv.Close()
+	p := &fakeProvider{replies: []reply{
+		{calls: []llm.ToolCall{{ID: "1", Name: "web_fetch", Args: map[string]any{"url": srv.URL}}}},
+		{tokens: []string{"ok"}},
+	}}
+	a := New(Options{Provider: p, WorkspaceRoot: t.TempDir()})
+	a.SetMode(ModeAuto)
+	var asked []*ApprovalRequest
+	evs, msgs := collect(t, a.Run(context.Background(), user("go")), func(r *ApprovalRequest) {
+		asked = append(asked, r)
+		r.Approve("")
+	})
+	done(t, evs)
+	if len(asked) != 1 || !strings.Contains(asked[0].Title, "private address") {
+		t.Fatalf("auto mode should confirm a fetch to %s, asked: %+v", srv.URL, asked)
+	}
+	var result string
+	for _, m := range msgs {
+		if m.Role == llm.RoleTool {
+			result = m.Content
+		}
+	}
+	if !strings.Contains(result, "router admin") {
+		t.Fatalf("approved private fetch should run, got %q", result)
+	}
+}
+
+func TestTransientProviderErrorIsRetried(t *testing.T) {
+	old := retryDelay
+	retryDelay = func(int) time.Duration { return time.Millisecond }
+	defer func() { retryDelay = old }()
+
+	p := &fakeProvider{replies: []reply{
+		{err: genai.APIError{Code: 429, Message: "quota"}},
+		{err: genai.APIError{Code: 503}},
+		{tokens: []string{"ok"}},
+	}}
+	a := New(Options{Provider: p})
+	evs, msgs := collect(t, a.Run(context.Background(), user("hi")), nil)
+	if d := done(t, evs); d.Err != nil {
+		t.Fatalf("turn should succeed after retries: %v", d.Err)
+	}
+	if len(p.requests) != 3 {
+		t.Fatalf("requests = %d, want 3", len(p.requests))
+	}
+	notices := 0
+	for _, ev := range evs {
+		if n, ok := ev.(NoticeEvent); ok && strings.Contains(n.Text, "retrying") {
+			notices++
+		}
+	}
+	if notices != 2 {
+		t.Errorf("retry notices = %d, want 2", notices)
+	}
+	if len(msgs) != 1 || msgs[0].Content != "ok" {
+		t.Errorf("messages = %+v", msgs)
+	}
+}
+
+func TestProviderErrorNotRetriedWhenPermanentOrAfterOutput(t *testing.T) {
+	old := retryDelay
+	retryDelay = func(int) time.Duration { return time.Millisecond }
+	defer func() { retryDelay = old }()
+
+	for name, r := range map[string]reply{
+		"client error":         {err: genai.APIError{Code: 400}},
+		"after streamed text":  {tokens: []string{"partial"}, err: genai.APIError{Code: 503}},
+		"gives up after limit": {err: genai.APIError{Code: 503}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			replies := []reply{r}
+			if name == "gives up after limit" {
+				replies = []reply{r, r, r, r, {tokens: []string{"never"}}}
+			}
+			p := &fakeProvider{replies: replies}
+			a := New(Options{Provider: p})
+			evs, _ := collect(t, a.Run(context.Background(), user("hi")), nil)
+			if d := done(t, evs); d.Err == nil {
+				t.Fatal("turn should fail")
+			}
+			want := 1
+			if name == "gives up after limit" {
+				want = 1 + maxStreamRetries
+			}
+			if len(p.requests) != want {
+				t.Fatalf("requests = %d, want %d", len(p.requests), want)
+			}
+		})
 	}
 }
 

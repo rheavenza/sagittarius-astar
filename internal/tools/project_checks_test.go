@@ -73,7 +73,7 @@ func TestRepoMapTool(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n"), 0o644)
 	os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc RunServer(port int) error { return nil }\n"), 0o644)
 
-	out, pw, err := Execute(llm.ToolCall{Name: "repo_map", Args: map[string]any{"dir": dir, "focus": "main.go", "max_tokens": float64(500)}})
+	out, pw, err := Execute(context.Background(), llm.ToolCall{Name: "repo_map", Args: map[string]any{"dir": dir, "focus": "main.go", "max_tokens": float64(500)}})
 	if err != nil || pw != nil {
 		t.Fatalf("err=%v pw=%v", err, pw)
 	}

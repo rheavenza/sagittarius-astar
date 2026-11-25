@@ -48,8 +48,9 @@ The agent can autonomously invoke these tools:
 
 ### Safety & Command Sandboxing
 - 🛡️ **Interactive Gating**: Full confirmation dialogs for file mutations (`write_file`, `edit_file`) showing unified diffs.
-- ⚡ **Auto-Approve Mode**: Enable auto-approve (`/approve-tools on` or CLI flag) to execute commands (`run_command`), MCP tools, `web_fetch` and out-of-workspace reads without confirmation prompts. Without it, reads inside the working directory run freely; everything else asks first.
+- ⚡ **Auto-Approve Mode**: Enable auto-approve (`/approve-tools on` or CLI flag) to execute commands (`run_command`), MCP tools, `web_fetch` and out-of-workspace reads without confirmation prompts (fetches to local or private addresses and sudo with a cached password still ask). Without it, reads inside the working directory run freely; everything else asks first.
 - 🔐 **Sudo via KDE dialog**: In a graphical session with `ksshaskpass` (or `$SUDO_ASKPASS`) available, `sudo` is run as `sudo -A` so the password goes through a desktop dialog and is never seen by aig.
+- 🔁 **Provider retries**: A rate limit (429), 5xx error or dropped connection is retried up to 3 times with backoff, as long as nothing has streamed yet. Client errors (bad key, unknown model) fail right away.
 - 🔄 **Loop Breaker Circuit**: Automatically intercepts and blocks infinite loops or cascading errors. If the model invokes the exact same tool with identical arguments 3 times consecutively, or experiences 3 consecutive tool failures, execution is aborted, and a warning is injected to force re-evaluation.
 - 🛑 **Graceful Interrupts**: Cancel active streams or executing sandbox commands safely using `Ctrl+C` without crashing the application.
 
@@ -134,7 +135,7 @@ On first launch, `aig` generates a default `config.json` at:
   |---|---|---|---|
   | ask (default) | ask | ask | ask |
   | accept edits | auto | ask | ask |
-  | auto | auto | auto, except destructive ones (`rm -rf`, force-push, `mkfs`, `rpm-ostree rebase`, …) | auto |
+  | auto | auto | auto, except destructive ones (`rm -rf`, `rm -r` outside the tree, `find -delete`, force-push, `git branch -D`, `mkfs`, `rpm-ostree rebase`, …) and sudo that would reuse a cached password | auto, except `web_fetch` to localhost / LAN / tailnet / metadata addresses |
   | plan | blocked | blocked | read-only tools only |
 
   Writes outside the workspace always ask. Set the startup mode with `"permission_mode": "accept-edits"` in config. `/approve-tools on|off` is a shortcut for `/mode auto|ask`.

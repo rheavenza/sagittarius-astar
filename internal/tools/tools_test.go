@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -34,7 +35,7 @@ func TestCommitWriteRejectsStaleProposal(t *testing.T) {
 	if err := os.WriteFile(path, []byte("one\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, pw, _ := Execute(llm.ToolCall{Name: "edit_file", Args: map[string]any{
+	_, pw, _ := Execute(context.Background(), llm.ToolCall{Name: "edit_file", Args: map[string]any{
 		"path": path, "old_content": "one", "new_content": "two",
 	}})
 	if pw == nil {
@@ -50,7 +51,7 @@ func TestCommitWriteRejectsStaleProposal(t *testing.T) {
 	}
 
 	// A fresh proposal commits fine.
-	_, pw, _ = Execute(llm.ToolCall{Name: "write_file", Args: map[string]any{
+	_, pw, _ = Execute(context.Background(), llm.ToolCall{Name: "write_file", Args: map[string]any{
 		"path": path, "content": "fresh",
 	}})
 	if err := CommitWrite(*pw); err != nil {
@@ -101,7 +102,7 @@ func TestSearchRegexSkipsIgnoredDirsAndBinaries(t *testing.T) {
 	must("node_modules/pkg/index.js", "needle in deps")
 	must("bin/blob", "needle\x00binary")
 
-	out, _, err := Execute(llm.ToolCall{Name: "search_regex", Args: map[string]any{"pattern": "needle", "dir": root}})
+	out, _, err := Execute(context.Background(), llm.ToolCall{Name: "search_regex", Args: map[string]any{"pattern": "needle", "dir": root}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,10 +131,19 @@ func TestDangerousCommand(t *testing.T) {
 		"git clean -fdx", "mkfs.ext4 /dev/sdb1", "dd if=x.iso of=/dev/sda",
 		"rpm-ostree rebase foo", "rpm-ostree install htop", "sudo reboot", "systemctl poweroff", "make && shutdown -h now",
 		"curl https://x.sh | sh", "chmod -R 777 /", "flatpak uninstall org.x",
+		// recursive rm without -f that reaches outside the working tree
+		"rm -r /etc/foo", "sudo rm -r /etc/foo", "rm -r ~/Documents", "rm -R ../other", "rm -rv $HOME/x",
+		"rm -r .", "rm -r *", "cd /tmp && rm -r -v /var/x", "rm --recursive /opt/x", "find . -name '*.tmp' | xargs rm -r",
+		"sudo -E rm -r /srv/data", "/bin/rm -r /x", "rm -r 'dir/../..'",
+		"find . -name '*.o' -delete", "find /tmp -exec rm {} +", "git branch -D main", "git branch --delete --force x",
+		"git stash drop", "git stash clear", "shred -u secret.txt", "podman system prune -a", "docker volume rm data",
+		"distrobox rm fedora",
 	}
 	safe := []string{
 		"rm file.txt", "rm -r build", "git push origin main", "git status",
 		"go test ./...", "ls -la", "make build", "rpm-ostree status", "echo reboot later",
+		"rm -r ./build", "rm -r dist node_modules/.cache", "find . -name '*.go'", "git branch -d feature",
+		"git branch -a", "git stash", "git stash pop", "podman ps", "ls -R /etc", "grep -r foo /etc",
 	}
 	for _, c := range dangerous {
 		if ok, _ := DangerousCommand(c); !ok {

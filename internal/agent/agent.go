@@ -12,9 +12,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
@@ -32,7 +34,31 @@ const (
 	// breakerLimit is how many identical calls / consecutive errors trip a
 	// loop breaker.
 	breakerLimit = 3
+	// maxStreamRetries is how often a request that failed with a transient
+	// error (rate limit, 5xx, dropped connection) is retried before
+	// anything was streamed.
+	maxStreamRetries = 3
 )
+
+// retryDelay is the wait before retry attempt+1: 2 s, 4 s, 8 s, plus up to
+// 25 % jitter so parallel clients don't retry in lockstep. A variable so
+// tests can shorten it.
+var retryDelay = func(attempt int) time.Duration {
+	d := 2 * time.Second << attempt
+	return d + time.Duration(rand.Int64N(int64(d/4)))
+}
+
+// shortError keeps a provider error readable in a one-line notice.
+func shortError(err error) string {
+	s := err.Error()
+	if code := llm.HTTPStatus(err); code != 0 {
+		s = fmt.Sprintf("HTTP %d", code)
+	}
+	if len(s) > 120 {
+		s = tools.TruncateUTF8(s, 117) + "…"
+	}
+	return s
+}
 
 // Options configures an Agent.
 type Options struct {
@@ -391,26 +417,49 @@ func (t *turn) stream(ctx context.Context) (text, reasoning string, calls []llm.
 		reasoning string
 		err       error
 	}
-	tokenCh := make(chan string, 64)
-	done := make(chan result, 1)
-	go func() {
-		c, r, e := t.provider.StreamChat(llm.WithUsage(ctx, &usage), outgoing, defs, tokenCh)
-		done <- result{c, r, e}
-	}()
-
+	var (
+		res    result
+		split  llm.ThinkSplitter
+		native strings.Builder
+	)
 	t.emit(StreamStartEvent{})
-	var split llm.ThinkSplitter
-	var native strings.Builder
-	for tok := range tokenCh {
-		if strings.HasPrefix(tok, "\x00") {
-			native.WriteString(tok[1:])
-			t.emit(TokenEvent{Text: tok[1:], Reasoning: true})
-			continue
+	for attempt := 0; ; attempt++ {
+		usage = llm.Usage{}
+		tokenCh := make(chan string, 64)
+		done := make(chan result, 1)
+		go func() {
+			c, r, e := t.provider.StreamChat(llm.WithUsage(ctx, &usage), outgoing, defs, tokenCh)
+			done <- result{c, r, e}
+		}()
+
+		received := false
+		for tok := range tokenCh {
+			received = true
+			if strings.HasPrefix(tok, "\x00") {
+				native.WriteString(tok[1:])
+				t.emit(TokenEvent{Text: tok[1:], Reasoning: true})
+				continue
+			}
+			split.Write(tok)
+			t.emit(TokenEvent{Text: tok})
 		}
-		split.Write(tok)
-		t.emit(TokenEvent{Text: tok})
+		res = <-done
+		// Retry only while nothing has been shown or acted on, so a retry
+		// can't duplicate output or tool calls.
+		if res.err == nil || received || len(res.calls) > 0 || ctx.Err() != nil ||
+			attempt >= maxStreamRetries || !llm.IsRetryable(res.err) {
+			break
+		}
+		delay := retryDelay(attempt)
+		logger.L.Warn("agent: transient provider error, retrying", "attempt", attempt+1, "delay", delay, "error", res.err)
+		t.emit(NoticeEvent{Level: NoticeWarn, Text: fmt.Sprintf(
+			"Provider error (%s); retrying in %s (%d/%d)…", shortError(res.err), delay.Round(100*time.Millisecond), attempt+1, maxStreamRetries)})
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return "", "", nil, ctx.Err()
+		}
 	}
-	res := <-done
 	split.Flush()
 	if res.err != nil {
 		return "", "", nil, res.err
